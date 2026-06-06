@@ -153,7 +153,8 @@ def generate_config_xml(files, output_dir):
         f.write(output)
     return xml_path
 
-def pack_courseware(courseware_dir, json_name, output_path, progress_callback=None):
+def pack_courseware(courseware_dir, json_name, output_path, progress_callback=None,
+                    backup_config=False, backup_unused=False):
     """
     将课件目录打包为 ENBX 文件（ZIP 格式），包含文件复制、XML 生成、压缩
     """
@@ -178,6 +179,36 @@ def pack_courseware(courseware_dir, json_name, output_path, progress_callback=No
         if progress_callback:
             wx.CallAfter(progress_callback, int((idx + 1) / len(files) * 50))
     generate_config_xml(files, temp_dir)
+
+    # ---- 备份到 dist/ 目录 ----
+    # 决定是否执行配置 JSON 备份（backup_unused 会强制启用）
+    do_config_backup = backup_config or backup_unused
+    if do_config_backup:
+        dist_dir = os.path.join(temp_dir, 'dist')
+        os.makedirs(dist_dir, exist_ok=True)
+        # 备份课件原始 JSON
+        try:
+            shutil.copy2(json_path, os.path.join(dist_dir, json_name))
+        except Exception as e:
+            if progress_callback:
+                wx.CallAfter(progress_callback, f"⚠️ 配置 JSON 备份失败: {e}")
+
+    # 备份未使用文件
+    if backup_unused:
+        # 获取已记录的文件名集合
+        used_names = {f['FileName'] for f in files}
+        # 遍历课件目录下所有文件，收集未在 CoursewareFiles 中的文件
+        for item in os.listdir(courseware_dir):
+            item_path = os.path.join(courseware_dir, item)
+            if not os.path.isfile(item_path):
+                continue
+            if item not in used_names:
+                try:
+                    shutil.copy2(item_path, os.path.join(dist_dir, item))
+                except Exception as e:
+                    if progress_callback:
+                        wx.CallAfter(progress_callback, f"⚠️ 未使用文件备份失败 ({item}): {e}")
+
     # 打包为 ZIP
     with zipfile.ZipFile(output_path, 'w', zipfile.ZIP_DEFLATED) as zf:
         for root, _, files_in in os.walk(temp_dir):
@@ -230,7 +261,10 @@ def load_settings():
             "account_paths": {},
             "skip_cids": [],
             "enable_hash_check": True,
-            "fail_counts": {}
+            "fail_counts": {},
+            "show_toast": True,
+            "backup_config": False, 
+            "backup_unused": False 
         }
     with open(SETTINGS_PATH, 'r', encoding='utf-8') as f:
         data = json.load(f)
@@ -238,6 +272,9 @@ def load_settings():
         data.setdefault("account_paths", {})
         data.setdefault("skip_cids", [])
         data.setdefault("enable_hash_check", True)
+        data.setdefault("show_toast", True)
+        data.setdefault("backup_config", False)
+        data.setdefault("backup_unused", False)
         return data
 
 def save_settings(settings):
@@ -277,7 +314,7 @@ class SquareButton(wx.Button):
 
 class ToastNotification(wx.PopupTransientWindow):
     """可撤销操作的浮动通知窗口，带撤销按钮，超时自动关闭"""
-    def __init__(self, parent, message, on_undo, timeout=10):
+    def __init__(self, parent, message, on_undo, timeout=7):
         super().__init__(parent, flags=wx.BORDER_SIMPLE)
         self.on_undo = on_undo
         self.timer = wx.Timer(self)
@@ -294,7 +331,7 @@ class ToastNotification(wx.PopupTransientWindow):
         msg_text.Wrap(300)
         sz.Add(msg_text, 1, wx.ALIGN_CENTER_VERTICAL | wx.ALL, 5)
 
-        btn_close = SquareButton(panel, label="❎️", style=wx.BORDER_NONE)
+        btn_close = SquareButton(panel, label="✕", style=wx.BORDER_NONE)
         btn_close.Bind(wx.EVT_BUTTON, lambda e: self.Dismiss())
         sz.Add(btn_close, 0, wx.ALIGN_CENTER_VERTICAL | wx.ALL, 5)
 
@@ -315,7 +352,7 @@ class ToastNotification(wx.PopupTransientWindow):
         self.timer.Start(1000)
 
         x = (screen_w - total_w) // 2
-        y = screen_h - total_h - 50
+        y = screen_h - total_h - 70
         self.SetPosition((x, y))
         self.Show()
 
@@ -870,7 +907,7 @@ class MainFrame(wx.Frame):
 
     def on_mgmt_browse(self, event):
         current = self.mgmt_dir_text.GetValue().strip()
-        default_path = current if os.path.isdir(current) else get_system_root()   # 修复拼写
+        default_path = current if os.path.isdir(current) else get_system_root()
         dlg = wx.DirDialog(self, "选择 Data 目录", defaultPath=default_path, style=wx.DD_DEFAULT_STYLE)
         if dlg.ShowModal() == wx.ID_OK:
             self.mgmt_dir_text.SetValue(dlg.GetPath())
@@ -894,6 +931,8 @@ class MainFrame(wx.Frame):
         total = len(to_pack)
         failed = []
         enable_checksum = self.settings.get('enable_hash_check', True)
+        backup_config = self.settings.get('backup_config', False)
+        backup_unused = self.settings.get('backup_unused', False)
         for idx, (acc, cid) in enumerate(to_pack):
             if acc not in self.courseware_data or cid not in self.courseware_data[acc]:
                 failed.append((acc, cid))
@@ -912,7 +951,8 @@ class MainFrame(wx.Frame):
             os.makedirs(os.path.dirname(out_path), exist_ok=True)
             try:
                 pack_courseware(cw_dir, json_name, out_path,
-                                progress_callback=lambda v: isinstance(v, int) and wx.CallAfter(self.mgmt_gauge.SetValue, v))
+                                progress_callback=lambda v: isinstance(v, int) and wx.CallAfter(self.mgmt_gauge.SetValue, v),
+                                backup_config=backup_config, backup_unused=backup_unused)
                 self.pack_log.append({
                     "account": acc, "cid": cid, "name": enbx_name,
                     "pack_time": int(time.time() * 1000), "output_path": out_path
@@ -1054,6 +1094,28 @@ class MainFrame(wx.Frame):
         chk_sz.Add(self.hash_check_cb, 0, wx.ALL, 5)
         main_sz.Add(chk_sz, 0, wx.EXPAND | wx.ALL, 5)
 
+        # 备份选项（新增）
+        backup_box = wx.StaticBox(self.settings_panel, label="备份选项")
+        backup_sz = wx.StaticBoxSizer(backup_box, wx.VERTICAL)
+
+        self.show_toast_cb = wx.CheckBox(backup_box, label="显示浮窗通知")
+        self.show_toast_cb.SetValue(self.settings.get('show_toast', True))
+        backup_sz.Add(self.show_toast_cb, 0, wx.ALL, 5)
+
+        self.backup_config_cb = wx.CheckBox(backup_box, label="保存课件配置 JSON 到 dist/ 目录")
+        self.backup_config_cb.SetValue(self.settings.get('backup_config', False))
+        backup_sz.Add(self.backup_config_cb, 0, wx.ALL, 5)
+
+        self.backup_unused_cb = wx.CheckBox(backup_box, label="保存未使用的文件到 dist/ 目录（含配置 JSON）")
+        self.backup_unused_cb.SetValue(self.settings.get('backup_unused', False))
+        self.backup_unused_cb.Bind(wx.EVT_CHECKBOX, self.on_backup_unused_toggle)
+        backup_sz.Add(self.backup_unused_cb, 0, wx.ALL, 5)
+
+        # 根据当前设置初始化禁用状态
+        self.on_backup_unused_toggle(None)
+
+        main_sz.Add(backup_sz, 0, wx.EXPAND | wx.ALL, 5)
+
         # 按账户自定义输出路径
         cust_box = wx.StaticBox(self.settings_panel, label="按账户自定义输出路径")
         cust_sz = wx.StaticBoxSizer(cust_box, wx.VERTICAL)
@@ -1104,6 +1166,14 @@ class MainFrame(wx.Frame):
         self.settings_panel.SetSizer(main_sz)
         self.refresh_account_list()
 
+    def on_backup_unused_toggle(self, event):
+        """当勾选“保存未使用的文件”时，强制勾选并禁用“保存课件配置JSON”"""
+        if self.backup_unused_cb.GetValue():
+            self.backup_config_cb.SetValue(True)
+            self.backup_config_cb.Enable(False)
+        else:
+            self.backup_config_cb.Enable(True)
+
     def refresh_account_list(self):
         self.account_list.DeleteAllItems()
         for i, acc in enumerate(sorted(self.courseware_data.keys() | self.account_paths.keys())):
@@ -1142,7 +1212,7 @@ class MainFrame(wx.Frame):
     def on_auto_pack_toggle(self, event):
         self.auto_pack_enabled = self.auto_pack_cb.GetValue()
         if self.auto_pack_enabled:
-            self.monitor_timer.Start(10000)
+            self.monitor_timer.Start(8000)
         else:
             self.monitor_timer.Stop()
 
@@ -1171,7 +1241,10 @@ class MainFrame(wx.Frame):
             'account_paths': self.account_paths,
             'skip_cids': list(self.skip_cids),
             'enable_hash_check': self.hash_check_cb.GetValue(),
-            'fail_counts': self.fail_counts
+            'fail_counts': self.fail_counts,
+            'show_toast': self.show_toast_cb.GetValue(),
+            'backup_config': self.backup_config_cb.GetValue(),
+            'backup_unused': self.backup_unused_cb.GetValue()
         })
         save_settings(self.settings)
         self.monitor_dir = self.settings['monitor_dir']
@@ -1179,7 +1252,7 @@ class MainFrame(wx.Frame):
         self.by_account = self.settings['by_account']
         self.auto_pack_enabled = self.settings['auto_pack']
         if self.auto_pack_enabled:
-            self.monitor_timer.Start(10000)
+            self.monitor_timer.Start(8000)
         else:
             self.monitor_timer.Stop()
         wx.MessageBox("设置已保存", "提示", wx.ICON_INFORMATION)
@@ -1254,6 +1327,8 @@ class MainFrame(wx.Frame):
             self._last_pack_state = {}
         new_data = scan_data_dir(self.monitor_dir)
         enable_checksum = self.settings.get('enable_hash_check', True)
+        backup_config = self.settings.get('backup_config', False)
+        backup_unused = self.settings.get('backup_unused', False)
         for acc, cw_dict in new_data.items():
             for cid, (info, files, cid_dir) in cw_dict.items():
                 if f"{acc}|{cid}" in self.skip_cids:
@@ -1269,7 +1344,8 @@ class MainFrame(wx.Frame):
                         os.makedirs(out_dir, exist_ok=True)
                         out_path = os.path.join(out_dir, safe_name)
                         threading.Thread(target=self._auto_pack_thread,
-                                         args=(cid_dir, f"{cid}.json", out_path, acc, cid, json_mtime, files, enable_checksum, info),daemon=True).start()
+                                         args=(cid_dir, f"{cid}.json", out_path, acc, cid, json_mtime, files, enable_checksum, info, backup_config, backup_unused),
+                                         daemon=True).start()
 
     def _on_auto_validation_fail(self, acc, cid, cw_name):
         """自动打包校验失败回调：累积失败次数，达到4次则永久跳过"""
@@ -1312,7 +1388,7 @@ class MainFrame(wx.Frame):
             self._last_pack_state = {}
         self._last_pack_state[key] = mtime
 
-    def _auto_pack_thread(self, cw_dir, json_name, out_path, acc, cid, json_mtime, files, enable_checksum, info):
+    def _auto_pack_thread(self, cw_dir, json_name, out_path, acc, cid, json_mtime, files, enable_checksum, info, backup_config, backup_unused):
         """自动打包线程：校验 -> 打包 -> 记录 -> 显示撤销通知"""
         cw_name = self._safe_str(info.get('Name', '') if info else '')
         invalid = validate_files(files, cw_dir, enable_checksum)
@@ -1323,7 +1399,7 @@ class MainFrame(wx.Frame):
         wx.CallAfter(self._on_auto_validation_success, acc, cid)
 
         try:
-            pack_courseware(cw_dir, json_name, out_path)
+            pack_courseware(cw_dir, json_name, out_path, backup_config=backup_config, backup_unused=backup_unused)
         except Exception as e:
             wx.CallAfter(self._add_failed_log, acc, cid, cw_name, out_path, str(e))
             return
@@ -1339,33 +1415,35 @@ class MainFrame(wx.Frame):
         wx.CallAfter(self.refresh_mgmt)
         wx.CallAfter(self.refresh_log_page)
 
-        def undo_action():
-            if os.path.exists(out_path):
-                os.remove(out_path)
-            try:
-                self.pack_log.remove(pack_record)
-            except ValueError:
-                pass
-            self.pack_log.append({
-                "account": acc,
-                "cid": cid,
-                "name": cw_name,
-                "pack_time": int(time.time() * 1000),
-                "output_path": out_path,
-                "skipped": True,
-                "undo": True
-            })
-            self.skip_cids.add(f"{acc}|{cid}")
-            self.settings["skip_cids"] = list(self.skip_cids)
-            save_settings(self.settings)
-            save_pack_log(self.pack_log)
-            wx.CallAfter(self.refresh_mgmt)
-            wx.CallAfter(self.refresh_log_page)
+        # 根据设置决定是否显示浮窗
+        if self.settings.get('show_toast', True):
+            def undo_action():
+                if os.path.exists(out_path):
+                    os.remove(out_path)
+                try:
+                    self.pack_log.remove(pack_record)
+                except ValueError:
+                    pass
+                self.pack_log.append({
+                    "account": acc,
+                    "cid": cid,
+                    "name": cw_name,
+                    "pack_time": int(time.time() * 1000),
+                    "output_path": out_path,
+                    "skipped": True,
+                    "undo": True
+                })
+                self.skip_cids.add(f"{acc}|{cid}")
+                self.settings["skip_cids"] = list(self.skip_cids)
+                save_settings(self.settings)
+                save_pack_log(self.pack_log)
+                wx.CallAfter(self.refresh_mgmt)
+                wx.CallAfter(self.refresh_log_page)
 
-        dir_name = os.path.basename(os.path.dirname(out_path))
-        wx.CallAfter(ToastNotification, self,
-                     f"文件 {os.path.basename(out_path)} 已保存到 {dir_name}",
-                     undo_action)
+            dir_name = os.path.basename(os.path.dirname(out_path))
+            wx.CallAfter(ToastNotification, self,
+                         f"文件 {os.path.basename(out_path)} 已保存到 {dir_name}",
+                         undo_action)
 
     def _add_failed_log(self, acc, cid, cw_name, out_path, error_msg):
         """添加自动打包失败的日志记录"""
@@ -1402,7 +1480,8 @@ class MainFrame(wx.Frame):
         features = ["📦 课件打包为 ENBX 格式", "📁 按账户自动转存到指定目录",
                     "⏭️ 支持永久跳过不需要的课件", "🧹 打包记录去重与撤销",
                     "📊 最近课件快速预览",
-                    "🔍 文件完整性校验"]
+                    "🔍 文件完整性校验",
+                    "💾 可选备份配置及未使用文件"]
         for text in features:
             main_sz.Add(wx.StaticText(panel, label=text), 0, wx.ALIGN_CENTER | wx.ALL, 2)
         main_sz.AddStretchSpacer()
