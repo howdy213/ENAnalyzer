@@ -263,8 +263,9 @@ def load_settings():
             "enable_hash_check": True,
             "fail_counts": {},
             "show_toast": True,
-            "backup_config": False, 
-            "backup_unused": False 
+            "toast_bottom_margin": 70,
+            "backup_config": False,
+            "backup_unused": False
         }
     with open(SETTINGS_PATH, 'r', encoding='utf-8') as f:
         data = json.load(f)
@@ -273,6 +274,7 @@ def load_settings():
         data.setdefault("skip_cids", [])
         data.setdefault("enable_hash_check", True)
         data.setdefault("show_toast", True)
+        data.setdefault("toast_bottom_margin", 70)
         data.setdefault("backup_config", False)
         data.setdefault("backup_unused", False)
         return data
@@ -314,11 +316,12 @@ class SquareButton(wx.Button):
 
 class ToastNotification(wx.PopupTransientWindow):
     """可撤销操作的浮动通知窗口，带撤销按钮，超时自动关闭"""
-    def __init__(self, parent, message, on_undo, timeout=7):
+    def __init__(self, parent, message, on_undo, timeout=7, bottom_margin=70):
         super().__init__(parent, flags=wx.BORDER_SIMPLE)
         self.on_undo = on_undo
         self.timer = wx.Timer(self)
         self.timeout = timeout
+        self.bottom_margin = bottom_margin
 
         panel = wx.Panel(self)
         sz = wx.BoxSizer(wx.HORIZONTAL)
@@ -352,7 +355,7 @@ class ToastNotification(wx.PopupTransientWindow):
         self.timer.Start(1000)
 
         x = (screen_w - total_w) // 2
-        y = screen_h - total_h - 70
+        y = screen_h - total_h - self.bottom_margin
         self.SetPosition((x, y))
         self.Show()
 
@@ -1094,8 +1097,8 @@ class MainFrame(wx.Frame):
         chk_sz.Add(self.hash_check_cb, 0, wx.ALL, 5)
         main_sz.Add(chk_sz, 0, wx.EXPAND | wx.ALL, 5)
 
-        # 备份选项（新增）
-        backup_box = wx.StaticBox(self.settings_panel, label="备份选项")
+        # 备份选项与通知设置
+        backup_box = wx.StaticBox(self.settings_panel, label="备份与通知")
         backup_sz = wx.StaticBoxSizer(backup_box, wx.VERTICAL)
 
         self.show_toast_cb = wx.CheckBox(backup_box, label="显示浮窗通知")
@@ -1110,6 +1113,18 @@ class MainFrame(wx.Frame):
         self.backup_unused_cb.SetValue(self.settings.get('backup_unused', False))
         self.backup_unused_cb.Bind(wx.EVT_CHECKBOX, self.on_backup_unused_toggle)
         backup_sz.Add(self.backup_unused_cb, 0, wx.ALL, 5)
+
+        # Toast 距离底部高度设置
+        toast_row = wx.BoxSizer(wx.HORIZONTAL)
+        toast_row.Add(wx.StaticText(backup_box, label="通知距离底部高度 (px):"), 0, wx.ALIGN_CENTER_VERTICAL | wx.LEFT, 5)
+        self.toast_bottom_spin = wx.SpinCtrl(backup_box, value=str(self.settings.get('toast_bottom_margin', 70)),
+                                             min=0, max=500, size=(80, -1))
+        self.toast_bottom_spin.SetToolTip("设置浮窗通知距离屏幕底部的像素距离")
+        toast_row.Add(self.toast_bottom_spin, 0, wx.ALL, 5)
+        preview_btn = wx.Button(backup_box, label="预览通知")
+        preview_btn.Bind(wx.EVT_BUTTON, self.on_preview_toast)
+        toast_row.Add(preview_btn, 0, wx.ALL, 5)
+        backup_sz.Add(toast_row, 0, wx.EXPAND | wx.ALL, 5)
 
         # 根据当前设置初始化禁用状态
         self.on_backup_unused_toggle(None)
@@ -1173,6 +1188,14 @@ class MainFrame(wx.Frame):
             self.backup_config_cb.Enable(False)
         else:
             self.backup_config_cb.Enable(True)
+
+    def on_preview_toast(self, event):
+        """预览浮窗通知，使用当前设置的距离底部高度"""
+        try:
+            bottom_margin = self.toast_bottom_spin.GetValue()
+        except Exception:
+            bottom_margin = 70
+        ToastNotification(self, "这是一条测试通知，自动消失", lambda: None, timeout=5, bottom_margin=bottom_margin)
 
     def refresh_account_list(self):
         self.account_list.DeleteAllItems()
@@ -1243,6 +1266,7 @@ class MainFrame(wx.Frame):
             'enable_hash_check': self.hash_check_cb.GetValue(),
             'fail_counts': self.fail_counts,
             'show_toast': self.show_toast_cb.GetValue(),
+            'toast_bottom_margin': self.toast_bottom_spin.GetValue(),
             'backup_config': self.backup_config_cb.GetValue(),
             'backup_unused': self.backup_unused_cb.GetValue()
         })
@@ -1417,6 +1441,7 @@ class MainFrame(wx.Frame):
 
         # 根据设置决定是否显示浮窗
         if self.settings.get('show_toast', True):
+            bottom_margin = self.settings.get('toast_bottom_margin', 70)
             def undo_action():
                 if os.path.exists(out_path):
                     os.remove(out_path)
@@ -1443,7 +1468,7 @@ class MainFrame(wx.Frame):
             dir_name = os.path.basename(os.path.dirname(out_path))
             wx.CallAfter(ToastNotification, self,
                          f"文件 {os.path.basename(out_path)} 已保存到 {dir_name}",
-                         undo_action)
+                         undo_action, bottom_margin=bottom_margin)
 
     def _add_failed_log(self, acc, cid, cw_name, out_path, error_msg):
         """添加自动打包失败的日志记录"""
