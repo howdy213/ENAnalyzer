@@ -1,3 +1,4 @@
+# ENAnalyzer.pyw
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
@@ -22,61 +23,16 @@ import hashlib
 from xml.etree.ElementTree import Element, SubElement, tostring
 from xml.dom import minidom
 
-# 全局常量
-APP_NAME = "ENAnalyzer"
-VERSION = "1.0.0"
+# 导入公共模块
+from Common import (
+    APP_NAME, VERSION, get_system_root, get_current_user_name,
+    get_active_user_profile, base_dir, sanitize_filename,
+    CONFIG_DIR, PACK_LOG_PATH, SETTINGS_PATH, DEFAULT_OUTPUT_DIR,
+    DEFAULT_DATA_DIR, load_settings, save_settings
+)
+from FunctionTab import FunctionTabPanel
+
 SILENT_MODE = "-silent" in sys.argv
-
-def get_system_root():
-    """返回系统盘根目录，例如 C:\\"""
-    drive = os.environ.get('SystemDrive', 'C:')
-    return drive + '\\'
-
-def get_current_user_name():
-    """
-    调用 Windows API GetUserNameW 获取当前登录用户名，返回字符串。
-    失败时回退到环境变量 USERNAME。
-    """
-    try:
-        buf = ctypes.create_unicode_buffer(256)
-        size = ctypes.c_ulong(len(buf))
-        if ctypes.windll.advapi32.GetUserNameW(buf, ctypes.byref(size)):
-            return buf.value
-    except Exception:
-        pass
-    return os.environ.get('USERNAME', '')
-
-def get_active_user_profile():
-    """
-    获取实际活动用户目录。
-    """
-    username = get_current_user_name()
-    if username.upper() != 'SYSTEM':
-        user_profile = os.path.join(get_system_root(), 'Users', username)
-        return user_profile
-    else:
-        os._exit(0)
-
-def base_dir():
-    """获取应用程序根目录"""
-    if getattr(sys, 'frozen', False):
-        return os.path.dirname(sys.executable)
-    return os.path.dirname(os.path.abspath(__file__))
-
-# 配置文件与日志路径
-CONFIG_DIR = os.path.join(base_dir(), "config")
-PACK_LOG_PATH = os.path.join(CONFIG_DIR, "pack_history.json")
-SETTINGS_PATH = os.path.join(CONFIG_DIR, "settings.json")
-_user_profile = get_active_user_profile()
-DEFAULT_OUTPUT_DIR = os.path.join(_user_profile, "Documents", "ENAnalyzer_Backup")
-DEFAULT_DATA_DIR = os.path.join(_user_profile, 'AppData', 'Roaming', 'Seewo', 'EasiNote5', 'Data')
-
-def sanitize_filename(name, default='untitled'):
-    """清理文件名中的非法字符，限制长度"""
-    if not name:
-        name = default
-    name = re.sub(r'[\\/*?:"<>|]', '_', name).strip(' .')
-    return name[:200] if name else default
 
 def parse_courseware_json(json_path):
     """解析希沃课件 JSON 文件，返回 (课件信息字典, 文件列表)"""
@@ -88,10 +44,7 @@ def parse_courseware_json(json_path):
     return data.get('Courseware', {}), data.get('CoursewareFiles', [])
 
 def validate_files(files, courseware_dir, enable_checksum=True):
-    """
-    校验文件完整性：存在性、下载完成标志、大小、哈希（可选）
-    返回无效文件列表 [(文件名, 原因), ...]
-    """
+    """校验文件完整性"""
     invalid = []
     for f in files:
         filename = f['FileName']
@@ -120,8 +73,7 @@ def validate_files(files, courseware_dir, enable_checksum=True):
                             if not chunk:
                                 break
                             hasher.update(chunk)
-                    actual_hash = hasher.hexdigest()
-                    if actual_hash.lower() != expected_hash.lower():
+                    if hasher.hexdigest().lower() != expected_hash.lower():
                         invalid.append((filename, "文件哈希不匹配"))
                 except Exception as e:
                     invalid.append((filename, f"读取文件出错: {e}"))
@@ -155,9 +107,7 @@ def generate_config_xml(files, output_dir):
 
 def pack_courseware(courseware_dir, json_name, output_path, progress_callback=None,
                     backup_config=False, backup_unused=False):
-    """
-    将课件目录打包为 ENBX 文件（ZIP 格式），包含文件复制、XML 生成、压缩
-    """
+    """将课件目录打包为 ENBX 文件"""
     json_path = os.path.join(courseware_dir, json_name)
     if not os.path.exists(json_path):
         raise FileNotFoundError(f"JSON 文件不存在: {json_path}")
@@ -166,7 +116,7 @@ def pack_courseware(courseware_dir, json_name, output_path, progress_callback=No
         raise ValueError("JSON 解析失败")
     temp_dir = os.path.join(os.path.dirname(output_path), f"__temp_{time.time_ns()}")
     os.makedirs(temp_dir, exist_ok=True)
-    # 复制文件到临时目录
+    # 复制文件
     for idx, f in enumerate(files):
         src = os.path.join(courseware_dir, f['FileName'])
         dst = os.path.join(temp_dir, f['RelativePath'].replace('/', os.sep))
@@ -180,24 +130,19 @@ def pack_courseware(courseware_dir, json_name, output_path, progress_callback=No
             wx.CallAfter(progress_callback, int((idx + 1) / len(files) * 50))
     generate_config_xml(files, temp_dir)
 
-    # ---- 备份到 dist/ 目录 ----
-    # 决定是否执行配置 JSON 备份（backup_unused 会强制启用）
+    # 备份到 dist/
     do_config_backup = backup_config or backup_unused
     if do_config_backup:
         dist_dir = os.path.join(temp_dir, 'dist')
         os.makedirs(dist_dir, exist_ok=True)
-        # 备份课件原始 JSON
         try:
             shutil.copy2(json_path, os.path.join(dist_dir, json_name))
         except Exception as e:
             if progress_callback:
                 wx.CallAfter(progress_callback, f"⚠️ 配置 JSON 备份失败: {e}")
 
-    # 备份未使用文件
     if backup_unused:
-        # 获取已记录的文件名集合
         used_names = {f['FileName'] for f in files}
-        # 遍历课件目录下所有文件，收集未在 CoursewareFiles 中的文件
         for item in os.listdir(courseware_dir):
             item_path = os.path.join(courseware_dir, item)
             if not os.path.isfile(item_path):
@@ -221,10 +166,7 @@ def pack_courseware(courseware_dir, json_name, output_path, progress_callback=No
     return output_path
 
 def scan_data_dir(data_dir):
-    """
-    扫描希沃数据目录，返回结构：
-    { 账户ID: { 课件ID: (课件信息, 文件列表, 课件目录路径), ... }, ... }
-    """
+    """扫描希沃数据目录，返回结构：{ 账户ID: { 课件ID: (课件信息, 文件列表, 课件目录路径) } }"""
     result = {}
     if not os.path.isdir(data_dir):
         return result
@@ -249,42 +191,6 @@ def scan_data_dir(data_dir):
             result[acc] = cw_dict
     return result
 
-# ----- 设置与日志读写函数 -----
-def load_settings():
-    """加载程序设置，提供默认值"""
-    if not os.path.exists(SETTINGS_PATH):
-        return {
-            "auto_pack": False,
-            "monitor_dir": DEFAULT_DATA_DIR,
-            "output_root": DEFAULT_OUTPUT_DIR,
-            "by_account": True,
-            "account_paths": {},
-            "skip_cids": [],
-            "enable_hash_check": True,
-            "fail_counts": {},
-            "show_toast": True,
-            "toast_bottom_margin": 70,
-            "backup_config": False,
-            "backup_unused": False
-        }
-    with open(SETTINGS_PATH, 'r', encoding='utf-8') as f:
-        data = json.load(f)
-        data.setdefault("fail_counts", {})
-        data.setdefault("account_paths", {})
-        data.setdefault("skip_cids", [])
-        data.setdefault("enable_hash_check", True)
-        data.setdefault("show_toast", True)
-        data.setdefault("toast_bottom_margin", 70)
-        data.setdefault("backup_config", False)
-        data.setdefault("backup_unused", False)
-        return data
-
-def save_settings(settings):
-    """保存设置到文件"""
-    os.makedirs(CONFIG_DIR, exist_ok=True)
-    with open(SETTINGS_PATH, 'w', encoding='utf-8') as f:
-        json.dump(settings, f, indent=2)
-
 def load_pack_log():
     """加载打包历史记录"""
     if not os.path.exists(PACK_LOG_PATH):
@@ -298,24 +204,24 @@ def save_pack_log(log):
     with open(PACK_LOG_PATH, 'w', encoding='utf-8') as f:
         json.dump(log, f, indent=2)
 
+# ---- 自定义控件 ----
+
 class SquareButton(wx.Button):
-    """保证按钮始终为正方形的按钮类"""
+    """保证按钮始终为正方形"""
     def __init__(self, parent, label, **kwargs):
         if 'style' not in kwargs:
             kwargs['style'] = 0
         super().__init__(parent, label=label, **kwargs)
-
         dc = wx.ClientDC(self)
         dc.SetFont(self.GetFont())
         text_size = dc.GetMultiLineTextExtent(label)
         edge = text_size.height + 8
-
         self.SetMinSize((edge, edge))
         self.SetMaxSize((edge, edge))
         self.SetSize((edge, edge))
 
 class ToastNotification(wx.PopupTransientWindow):
-    """可撤销操作的浮动通知窗口，带撤销按钮，超时自动关闭"""
+    """带撤销按钮的浮动通知"""
     def __init__(self, parent, message, on_undo, timeout=7, bottom_margin=70):
         super().__init__(parent, flags=wx.BORDER_SIMPLE)
         self.on_undo = on_undo
@@ -334,7 +240,7 @@ class ToastNotification(wx.PopupTransientWindow):
         msg_text.Wrap(300)
         sz.Add(msg_text, 1, wx.ALIGN_CENTER_VERTICAL | wx.ALL, 5)
 
-        btn_close = SquareButton(panel, label="✕", style=wx.BORDER_NONE)
+        btn_close = SquareButton(panel, label="✕")
         btn_close.Bind(wx.EVT_BUTTON, lambda e: self.Dismiss())
         sz.Add(btn_close, 0, wx.ALIGN_CENTER_VERTICAL | wx.ALL, 5)
 
@@ -343,7 +249,7 @@ class ToastNotification(wx.PopupTransientWindow):
 
         txt_w = msg_text.GetBestSize().width
         btn_h = btn_undo.GetBestSize().height
-        total_w = btn_h*2 + txt_w + 30 + 60   # 两个正方形按钮 + 文本 + 间隔
+        total_w = btn_h * 2 + txt_w + 30 + 60
         total_w = max(total_w, 300)
         screen_w, screen_h = wx.DisplaySize()
         total_w = min(total_w, screen_w - 40)
@@ -374,7 +280,7 @@ class ToastNotification(wx.PopupTransientWindow):
         super().Dismiss()
 
 class TaskBarIcon(wx.adv.TaskBarIcon):
-    """系统托盘图标，左键显示主窗口，右键菜单显示/退出"""
+    """系统托盘图标"""
     def __init__(self, frame):
         super().__init__()
         self.frame = frame
@@ -405,8 +311,9 @@ class TaskBarIcon(wx.adv.TaskBarIcon):
     def on_exit(self, event):
         self.frame.on_real_exit(None)
 
+# ---- 主窗口 ----
+
 class MainFrame(wx.Frame):
-    """主窗口，包含所有UI界面和业务逻辑"""
     def __init__(self):
         super().__init__(None, title=APP_NAME, size=(1050, 750))
         self.settings = load_settings()
@@ -415,16 +322,13 @@ class MainFrame(wx.Frame):
         self.fail_counts = self.settings.get("fail_counts", {})
         self.fail_lock = threading.Lock()
 
-        # 开机自启动服务路径
         self.auto_start_exe = os.path.join(base_dir(), "tools", "AutoStartService.exe")
         self.has_service_exe = os.path.isfile(self.auto_start_exe)
 
-        # 程序图标
         icon_path = os.path.join(base_dir(), "asset", "ENAnalyzer.ico")
         if os.path.exists(icon_path):
             self.SetIcon(wx.Icon(icon_path, wx.BITMAP_TYPE_ICO))
 
-        # 初始化各种路径与状态
         self.data_dir = DEFAULT_DATA_DIR
         self.auto_pack_enabled = self.settings.get("auto_pack", False)
         self.monitor_dir = self.settings.get("monitor_dir", self.data_dir)
@@ -433,7 +337,6 @@ class MainFrame(wx.Frame):
         self.account_paths = self.settings.get("account_paths", {})
         self.skip_cids = set(self.settings.get("skip_cids", []))
 
-        # 创建 Notebook 标签页
         self.notebook = wx.Notebook(self)
         self.home_panel = wx.Panel(self.notebook)
         self.mgmt_panel = wx.Panel(self.notebook)
@@ -441,13 +344,16 @@ class MainFrame(wx.Frame):
         self.settings_panel = wx.Panel(self.notebook)
         self.about_panel = wx.Panel(self.notebook)
 
+        # 新增功能设置 Tab
+        self.function_panel = FunctionTabPanel(self.notebook)
+
         self.notebook.AddPage(self.home_panel, "首页")
         self.notebook.AddPage(self.mgmt_panel, "课件管理")
         self.notebook.AddPage(self.log_panel, "打包记录")
         self.notebook.AddPage(self.settings_panel, "转存设置")
+        self.notebook.AddPage(self.function_panel, "功能设置")   # 新页面
         self.notebook.AddPage(self.about_panel, "关于")
 
-        # 初始化各页面
         self.init_home_page()
         self.init_mgmt_page()
         self.init_log_page()
@@ -457,7 +363,6 @@ class MainFrame(wx.Frame):
         self.Bind(wx.EVT_CLOSE, self.on_close)
         self.tray_icon = TaskBarIcon(self)
 
-        # 自动监控定时器
         self.monitor_timer = wx.Timer(self)
         self.Bind(wx.EVT_TIMER, self.on_monitor_tick, self.monitor_timer)
         if self.auto_pack_enabled:
@@ -466,21 +371,18 @@ class MainFrame(wx.Frame):
         self.refresh_mgmt()
         self.Center()
 
-        # 根据 SILENT_MODE 决定是否显示主窗口
         if not SILENT_MODE:
             self.Show()
 
-    # ---------- 管理员权限相关辅助方法 ----------
+    # ---- 管理员权限相关（保留原逻辑） ----
     @staticmethod
     def is_admin():
-        """判断当前进程是否以管理员身份运行"""
         try:
             return ctypes.windll.shell32.IsUserAnAdmin()
         except Exception:
             return False
 
     def run_as_admin(self, exe_path, params, wait=True):
-        """以管理员身份运行程序，使用宽字符参数避免路径编码问题。"""
         class SHELLEXECUTEINFO(ctypes.Structure):
             _fields_ = [
                 ("cbSize", ctypes.c_ulong),
@@ -529,7 +431,6 @@ class MainFrame(wx.Frame):
         return str(val) if val is not None else ""
 
     def _get_courseware_file_mtime(self, cid_dir):
-        """获取课件根目录下直接文件的最大修改时间"""
         max_time = 0.0
         try:
             for item in os.listdir(cid_dir):
@@ -545,7 +446,7 @@ class MainFrame(wx.Frame):
             pass
         return max_time
 
-    # ---------- 首页 ----------
+    # ---- 首页 ----
     def init_home_page(self):
         self.home_scroll = wx.ScrolledWindow(self.home_panel)
         self.home_scroll.SetScrollRate(5, 5)
@@ -554,40 +455,34 @@ class MainFrame(wx.Frame):
         self.home_panel.GetSizer().Add(self.home_scroll, 1, wx.EXPAND)
 
     def refresh_home_page(self):
-        """刷新首页，显示最多6个课件卡片，3×2网格，按文件修改时间排序，自动适应宽度"""
         self.home_scroll.DestroyChildren()
         items = []
         for acc, cw_dict in self.courseware_data.items():
             for cid, (info, _, cid_dir) in cw_dict.items():
-                json_mtime = info.get('UpdateTime', 0) / 1000.0       # 状态判断用
-                file_mtime = self._get_courseware_file_mtime(cid_dir) # 显示及排序用
-                size = sum(
-                    os.path.getsize(os.path.join(cid_dir, f))
-                    for f in os.listdir(cid_dir)
-                    if os.path.isfile(os.path.join(cid_dir, f))
-                )
+                json_mtime = info.get('UpdateTime', 0) / 1000.0
+                file_mtime = self._get_courseware_file_mtime(cid_dir)
+                size = sum(os.path.getsize(os.path.join(cid_dir, f))
+                           for f in os.listdir(cid_dir)
+                           if os.path.isfile(os.path.join(cid_dir, f)))
                 status, color = self.get_pack_status(acc, cid, json_mtime)
                 items.append({
                     'acc': acc, 'cid': cid,
                     'name': self._safe_str(info.get('Name')),
                     'author': self._safe_str(info.get('Author')),
-                    'mtime': json_mtime,       # 内部使用，不直接显示
-                    'file_mtime': file_mtime,  # 显示用
+                    'mtime': json_mtime,
+                    'file_mtime': file_mtime,
                     'size': size,
                     'status': status, 'color': color
                 })
         items.sort(key=lambda x: x['file_mtime'], reverse=True)
         top6 = items[:6]
 
-        # 计算可用宽度，用于限制卡片最大宽度
-        self.home_scroll.GetParent().Layout()  # 强制更新布局以获取准确尺寸
         client_width = self.home_scroll.GetClientSize().width
         if client_width <= 0:
-            client_width = 800  # 默认值
-        # 3 列网格，左右留白，列间距 10px
-        col_width = (client_width - 30) // 3   # 30 为左右边距总和 (15+15)
+            client_width = 800
+        col_width = (client_width - 30) // 3
         if col_width < 200:
-            col_width = 200  # 最小宽度
+            col_width = 200
 
         sz = wx.BoxSizer(wx.VERTICAL)
         welcome = wx.StaticText(self.home_scroll, label=f"欢迎使用 {APP_NAME}")
@@ -609,16 +504,15 @@ class MainFrame(wx.Frame):
                 card = wx.Panel(self.home_scroll)
                 card.SetBackgroundColour(wx.WHITE)
                 card.SetWindowStyleFlag(wx.BORDER_SIMPLE)
-                card.SetMaxSize((col_width, -1))          # 限制卡片最大宽度
+                card.SetMaxSize((col_width, -1))
                 card_sz = wx.BoxSizer(wx.VERTICAL)
 
                 title = wx.StaticText(card, label=item['name'])
                 title.SetFont(wx.Font(12, wx.FONTFAMILY_DEFAULT, wx.FONTSTYLE_NORMAL, wx.FONTWEIGHT_BOLD))
-                title.Wrap(col_width - 20)                # 标题根据卡片宽度换行
+                title.Wrap(col_width - 20)
                 card_sz.Add(title, 0, wx.ALL | wx.EXPAND, 8)
 
                 grid = wx.FlexGridSizer(cols=2, vgap=4, hgap=15)
-                # 使用 file_mtime 显示文件实际修改时间
                 pairs = [
                     ("账户", item['acc']),
                     ("作者", item['author']),
@@ -648,7 +542,6 @@ class MainFrame(wx.Frame):
                 card.SetSizer(card_sz)
                 grid_sz.Add(card, 0, wx.EXPAND | wx.ALL, 0)
 
-            # 不足 6 个时填充空白
             for _ in range(len(top6), 6):
                 grid_sz.Add(wx.Panel(self.home_scroll), 0, wx.EXPAND)
 
@@ -658,7 +551,7 @@ class MainFrame(wx.Frame):
         self.home_scroll.Layout()
         self.home_scroll.SetVirtualSize(sz.GetMinSize())
 
-    # ---------- 课件管理页面 ----------
+    # ---- 课件管理 ----
     def init_mgmt_page(self):
         main_sz = wx.BoxSizer(wx.VERTICAL)
         hdir = wx.BoxSizer(wx.HORIZONTAL)
@@ -678,7 +571,6 @@ class MainFrame(wx.Frame):
         self.mgmt_search = wx.TextCtrl(self.mgmt_panel, size=(200, -1))
         self.mgmt_search.Bind(wx.EVT_TEXT, self.on_mgmt_search)
         htools.Add(self.mgmt_search, 0, wx.ALL, 5)
-        # 操作按钮行
         for label, handler in [("全选", self.on_mgmt_select_all), ("取消全选", self.on_mgmt_unselect_all),
                                ("标记已打包", self.on_mark_packed), ("标记为跳过", self.on_mark_skip),
                                ("还原状态", self.on_unmark_skip), ("删除选中", self.on_delete_selected)]:
@@ -710,7 +602,6 @@ class MainFrame(wx.Frame):
         self.mgmt_sort_asc = True
 
     def refresh_mgmt(self, filter_text=""):
-        """扫描数据目录，刷新课件管理列表"""
         self.mgmt_selected.clear()
         self.mgmt_list.DeleteAllItems()
         self.mgmt_data.clear()
@@ -742,7 +633,6 @@ class MainFrame(wx.Frame):
         self.refresh_home_page()
 
     def get_pack_status(self, acc, cid, json_mtime):
-        """根据打包记录和跳过列表，返回(状态文本, 颜色)"""
         if f"{acc}|{cid}" in self.skip_cids:
             for rec in self.pack_log:
                 if rec['account'] == acc and rec['cid'] == cid and rec.get('undo'):
@@ -781,7 +671,6 @@ class MainFrame(wx.Frame):
             self.mgmt_list.SetItem(row, 6, status_text)
             self.mgmt_list.SetItemTextColour(row, color)
 
-    # 列表交互事件
     def on_mgmt_col_click(self, event):
         col = event.GetColumn()
         if col not in (2, 3, 4, 5):
@@ -911,7 +800,7 @@ class MainFrame(wx.Frame):
     def on_mgmt_browse(self, event):
         current = self.mgmt_dir_text.GetValue().strip()
         default_path = current if os.path.isdir(current) else get_system_root()
-        dlg = wx.DirDialog(self, "选择 Data 目录", defaultPath=default_path, style=wx.DD_DEFAULT_STYLE)
+        dlg = wx.DirDialog(self, "选择 Data 目录", defaultPath=default_path)
         if dlg.ShowModal() == wx.ID_OK:
             self.mgmt_dir_text.SetValue(dlg.GetPath())
             self.refresh_mgmt()
@@ -922,7 +811,7 @@ class MainFrame(wx.Frame):
             wx.MessageBox("请勾选要打包的课件", "提示", wx.ICON_INFORMATION)
             return
         default_path = self.output_root if os.path.isdir(self.output_root) else get_system_root()
-        dlg = wx.DirDialog(self, "选择保存目录", defaultPath=default_path, style=wx.DD_DEFAULT_STYLE)
+        dlg = wx.DirDialog(self, "选择保存目录", defaultPath=default_path)
         if dlg.ShowModal() != wx.ID_OK:
             dlg.Destroy()
             return
@@ -970,7 +859,7 @@ class MainFrame(wx.Frame):
         wx.CallAfter(self.refresh_mgmt)
         wx.CallAfter(self.refresh_log_page)
 
-    # ---------- 打包记录页面 ----------
+    # ---- 打包记录 ----
     def init_log_page(self):
         sz = wx.BoxSizer(wx.VERTICAL)
         self.log_list = wx.ListCtrl(self.log_panel, style=wx.LC_REPORT)
@@ -989,7 +878,6 @@ class MainFrame(wx.Frame):
         self.refresh_log_page()
 
     def refresh_log_page(self):
-        """刷新打包记录列表，正确显示失败、跳过等状态"""
         self.log_list.DeleteAllItems()
         for rec in self.pack_log:
             row = self.log_list.InsertItem(self.log_list.GetItemCount(), rec['account'])
@@ -1049,10 +937,9 @@ class MainFrame(wx.Frame):
         self.refresh_log_page()
         self.refresh_mgmt()
 
-    # ---------- 设置页面 ----------
+    # ---- 转存设置 ----
     def init_settings_page(self):
         main_sz = wx.BoxSizer(wx.VERTICAL)
-        # 自动转存
         auto_box = wx.StaticBox(self.settings_panel, label="自动转存")
         auto_sz = wx.StaticBoxSizer(auto_box, wx.VERTICAL)
         self.auto_pack_cb = wx.CheckBox(auto_box, label="启用自动转存（每10秒检测新修改的课件）")
@@ -1061,10 +948,8 @@ class MainFrame(wx.Frame):
         auto_sz.Add(self.auto_pack_cb, 0, wx.ALL, 5)
         main_sz.Add(auto_sz, 0, wx.EXPAND | wx.ALL, 5)
 
-        # 路径设置
         path_box = wx.StaticBox(self.settings_panel, label="路径设置")
         path_sz = wx.StaticBoxSizer(path_box, wx.VERTICAL)
-        # 监控目录行
         row1_sz = wx.BoxSizer(wx.HORIZONTAL)
         row1_sz.Add(wx.StaticText(path_box, label="监控目录（Data）:", size=(120, -1)), 0, wx.ALIGN_CENTER_VERTICAL)
         self.monitor_dir_text = wx.TextCtrl(path_box, value=self.monitor_dir)
@@ -1074,7 +959,6 @@ class MainFrame(wx.Frame):
         row1_sz.Add(btn_mon, 0, wx.LEFT, 5)
         path_sz.Add(row1_sz, 0, wx.EXPAND | wx.ALL, 5)
 
-        # 输出根目录行
         row2_sz = wx.BoxSizer(wx.HORIZONTAL)
         row2_sz.Add(wx.StaticText(path_box, label="输出根目录:", size=(120, -1)), 0, wx.ALIGN_CENTER_VERTICAL)
         self.output_root_text = wx.TextCtrl(path_box, value=self.output_root)
@@ -1089,7 +973,6 @@ class MainFrame(wx.Frame):
         path_sz.Add(self.by_account_cb, 0, wx.ALL, 5)
         main_sz.Add(path_sz, 0, wx.EXPAND | wx.ALL, 5)
 
-        # 校验选项
         chk_box = wx.StaticBox(self.settings_panel, label="校验选项")
         chk_sz = wx.StaticBoxSizer(chk_box, wx.VERTICAL)
         self.hash_check_cb = wx.CheckBox(chk_box, label="启用文件哈希校验")
@@ -1097,10 +980,8 @@ class MainFrame(wx.Frame):
         chk_sz.Add(self.hash_check_cb, 0, wx.ALL, 5)
         main_sz.Add(chk_sz, 0, wx.EXPAND | wx.ALL, 5)
 
-        # 备份选项与通知设置
         backup_box = wx.StaticBox(self.settings_panel, label="备份与通知")
         backup_sz = wx.StaticBoxSizer(backup_box, wx.VERTICAL)
-
         self.show_toast_cb = wx.CheckBox(backup_box, label="显示浮窗通知")
         self.show_toast_cb.SetValue(self.settings.get('show_toast', True))
         backup_sz.Add(self.show_toast_cb, 0, wx.ALL, 5)
@@ -1114,24 +995,19 @@ class MainFrame(wx.Frame):
         self.backup_unused_cb.Bind(wx.EVT_CHECKBOX, self.on_backup_unused_toggle)
         backup_sz.Add(self.backup_unused_cb, 0, wx.ALL, 5)
 
-        # Toast 距离底部高度设置
         toast_row = wx.BoxSizer(wx.HORIZONTAL)
         toast_row.Add(wx.StaticText(backup_box, label="通知距离底部高度 (px):"), 0, wx.ALIGN_CENTER_VERTICAL | wx.LEFT, 5)
         self.toast_bottom_spin = wx.SpinCtrl(backup_box, value=str(self.settings.get('toast_bottom_margin', 70)),
                                              min=0, max=500, size=(80, -1))
-        self.toast_bottom_spin.SetToolTip("设置浮窗通知距离屏幕底部的像素距离")
         toast_row.Add(self.toast_bottom_spin, 0, wx.ALL, 5)
         preview_btn = wx.Button(backup_box, label="预览通知")
         preview_btn.Bind(wx.EVT_BUTTON, self.on_preview_toast)
         toast_row.Add(preview_btn, 0, wx.ALL, 5)
         backup_sz.Add(toast_row, 0, wx.EXPAND | wx.ALL, 5)
 
-        # 根据当前设置初始化禁用状态
         self.on_backup_unused_toggle(None)
-
         main_sz.Add(backup_sz, 0, wx.EXPAND | wx.ALL, 5)
 
-        # 按账户自定义输出路径
         cust_box = wx.StaticBox(self.settings_panel, label="按账户自定义输出路径")
         cust_sz = wx.StaticBoxSizer(cust_box, wx.VERTICAL)
         self.account_list = wx.ListCtrl(cust_box, style=wx.LC_REPORT | wx.LC_SINGLE_SEL)
@@ -1148,29 +1024,23 @@ class MainFrame(wx.Frame):
         cust_sz.Add(btn_row, 0, wx.ALIGN_LEFT | wx.ALL, 5)
         main_sz.Add(cust_sz, 1, wx.EXPAND | wx.ALL, 5)
 
-        # 开机自启动服务
         service_box = wx.StaticBox(self.settings_panel, label="开机自启动服务")
         service_sz = wx.StaticBoxSizer(service_box, wx.VERTICAL)
-
         status_row = wx.BoxSizer(wx.HORIZONTAL)
         self.service_status_label = wx.StaticText(service_box, label="检测中...")
         status_row.Add(self.service_status_label, 0, wx.ALIGN_CENTER_VERTICAL | wx.ALL, 5)
         service_sz.Add(status_row, 0, wx.EXPAND | wx.ALL, 5)
-
         btn_row = wx.BoxSizer(wx.HORIZONTAL)
         self.btn_install = wx.Button(service_box, label="安装服务")
         self.btn_install.Bind(wx.EVT_BUTTON, lambda e: self.install_service())
         btn_row.Add(self.btn_install, 0, wx.ALL, 5)
-
         self.btn_uninstall = wx.Button(service_box, label="卸载服务")
         self.btn_uninstall.Bind(wx.EVT_BUTTON, lambda e: self.uninstall_service())
         btn_row.Add(self.btn_uninstall, 0, wx.ALL, 5)
-
         self.btn_refresh = wx.Button(service_box, label="刷新状态")
         self.btn_refresh.Bind(wx.EVT_BUTTON, lambda e: self.refresh_service_status())
         btn_row.Add(self.btn_refresh, 0, wx.ALL, 5)
         service_sz.Add(btn_row, 0, wx.ALIGN_CENTER | wx.ALL, 5)
-
         main_sz.Add(service_sz, 0, wx.EXPAND | wx.ALL, 10)
 
         self.refresh_service_status()
@@ -1182,7 +1052,6 @@ class MainFrame(wx.Frame):
         self.refresh_account_list()
 
     def on_backup_unused_toggle(self, event):
-        """当勾选“保存未使用的文件”时，强制勾选并禁用“保存课件配置JSON”"""
         if self.backup_unused_cb.GetValue():
             self.backup_config_cb.SetValue(True)
             self.backup_config_cb.Enable(False)
@@ -1190,7 +1059,6 @@ class MainFrame(wx.Frame):
             self.backup_config_cb.Enable(True)
 
     def on_preview_toast(self, event):
-        """预览浮窗通知，使用当前设置的距离底部高度"""
         try:
             bottom_margin = self.toast_bottom_spin.GetValue()
         except Exception:
@@ -1217,12 +1085,12 @@ class MainFrame(wx.Frame):
         account = self.account_list.GetItemText(selected, 0)
         custom_path = self.account_paths.get(account, "")
         default_path = custom_path if os.path.isdir(custom_path) else get_system_root()
-        dlg = wx.DirDialog(self, f"为 {account} 选择保存目录", defaultPath=default_path, style=wx.DD_DEFAULT_STYLE)
+        dlg = wx.DirDialog(self, f"为 {account} 选择保存目录", defaultPath=default_path)
         if dlg.ShowModal() == wx.ID_OK:
             self.account_paths[account] = dlg.GetPath()
             self.account_list.SetItem(selected, 1, self.account_paths[account])
         dlg.Destroy()
-    
+
     def on_clear_account_path(self, event):
         selected = self.account_list.GetFirstSelected()
         if selected == -1:
@@ -1242,7 +1110,7 @@ class MainFrame(wx.Frame):
     def on_select_monitor_dir(self, event):
         current = self.monitor_dir_text.GetValue().strip()
         default_path = current if os.path.isdir(current) else get_system_root()
-        dlg = wx.DirDialog(self, "选择监控目录", defaultPath=default_path, style=wx.DD_DEFAULT_STYLE)
+        dlg = wx.DirDialog(self, "选择监控目录", defaultPath=default_path)
         if dlg.ShowModal() == wx.ID_OK:
             self.monitor_dir_text.SetValue(dlg.GetPath())
         dlg.Destroy()
@@ -1250,7 +1118,7 @@ class MainFrame(wx.Frame):
     def on_select_output_dir(self, event):
         current = self.output_root_text.GetValue().strip()
         default_path = current if os.path.isdir(current) else get_system_root()
-        dlg = wx.DirDialog(self, "选择输出根目录", defaultPath=default_path, style=wx.DD_DEFAULT_STYLE)
+        dlg = wx.DirDialog(self, "选择输出根目录", defaultPath=default_path)
         if dlg.ShowModal() == wx.ID_OK:
             self.output_root_text.SetValue(dlg.GetPath())
         dlg.Destroy()
@@ -1281,9 +1149,8 @@ class MainFrame(wx.Frame):
             self.monitor_timer.Stop()
         wx.MessageBox("设置已保存", "提示", wx.ICON_INFORMATION)
 
-    # ---------- 服务安装相关 ----------
+    # ---- 服务安装（保留原逻辑） ----
     def query_service_status(self):
-        """查询服务安装状态，返回 True 表示已安装"""
         if not self.has_service_exe:
             return False
         try:
@@ -1296,13 +1163,9 @@ class MainFrame(wx.Frame):
             return False
 
     def _run_service_operation(self, operation, params):
-        """后台执行服务操作（安装/卸载），完成后刷新状态"""
         try:
             if self.is_admin():
-                subprocess.run(
-                    [self.auto_start_exe, params],
-                    capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW
-                )
+                subprocess.run([self.auto_start_exe, params], capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW)
             else:
                 self.run_as_admin(self.auto_start_exe, params, wait=True)
         except Exception as e:
@@ -1317,20 +1180,17 @@ class MainFrame(wx.Frame):
         threading.Thread(target=self._run_service_operation, args=("uninstall", "/uninstall"), daemon=True).start()
 
     def refresh_service_status(self):
-        """刷新 UI 上的服务状态标签和按钮"""
         if not self.has_service_exe:
             self.service_status_label.SetLabel("未找到 tools\\AutoStartService.exe")
             self.service_status_label.SetForegroundColour(wx.RED)
             self.btn_install.Enable(False)
             self.btn_uninstall.Enable(False)
             return
-
         installed = self.query_service_status()
         if installed:
             text, color = "服务已安装", wx.GREEN
         else:
             text, color = "服务未安装", wx.RED
-
         self.service_status_label.SetLabel(text)
         self.service_status_label.SetForegroundColour(color)
         self.service_status_label.Refresh()
@@ -1339,12 +1199,10 @@ class MainFrame(wx.Frame):
         self.btn_uninstall.Enable(installed)
 
     def update_service_status_ui(self):
-        """供后台线程调用的 UI 更新"""
         self.refresh_service_status()
 
-    # ---------- 自动监控与打包 ----------
+    # ---- 自动打包监控 ----
     def on_monitor_tick(self, event):
-        """定时器触发，检查新修改的课件并自动打包"""
         if not self.auto_pack_enabled:
             return
         if not hasattr(self, '_last_pack_state'):
@@ -1372,21 +1230,15 @@ class MainFrame(wx.Frame):
                                          daemon=True).start()
 
     def _on_auto_validation_fail(self, acc, cid, cw_name):
-        """自动打包校验失败回调：累积失败次数，达到4次则永久跳过"""
         key = f"{acc}_{cid}"
         self.fail_counts[key] = self.fail_counts.get(key, 0) + 1
         if self.fail_counts[key] >= 4:
             self.skip_cids.add(f"{acc}|{cid}")
             del self.fail_counts[key]
             self.pack_log.append({
-                "account": acc,
-                "cid": cid,
-                "name": cw_name,
-                "pack_time": int(time.time() * 1000),
-                "output_path": "",
-                "skipped": True,
-                "failed": True,
-                "reason": "连续4次下载失败，自动跳过"
+                "account": acc, "cid": cid, "name": cw_name,
+                "pack_time": int(time.time() * 1000), "output_path": "",
+                "skipped": True, "failed": True, "reason": "连续4次下载失败，自动跳过"
             })
             save_pack_log(self.pack_log)
         else:
@@ -1413,23 +1265,18 @@ class MainFrame(wx.Frame):
         self._last_pack_state[key] = mtime
 
     def _auto_pack_thread(self, cw_dir, json_name, out_path, acc, cid, json_mtime, files, enable_checksum, info, backup_config, backup_unused):
-        """自动打包线程：校验 -> 打包 -> 记录 -> 显示撤销通知"""
         cw_name = self._safe_str(info.get('Name', '') if info else '')
         invalid = validate_files(files, cw_dir, enable_checksum)
         if invalid:
             wx.CallAfter(self._on_auto_validation_fail, acc, cid, cw_name)
             return
-
         wx.CallAfter(self._on_auto_validation_success, acc, cid)
-
         try:
             pack_courseware(cw_dir, json_name, out_path, backup_config=backup_config, backup_unused=backup_unused)
         except Exception as e:
             wx.CallAfter(self._add_failed_log, acc, cid, cw_name, out_path, str(e))
             return
-
         wx.CallAfter(self._update_last_pack_state, acc, cid, json_mtime)
-
         pack_record = {
             "account": acc, "cid": cid, "name": cw_name,
             "pack_time": int(time.time() * 1000), "output_path": out_path
@@ -1438,8 +1285,6 @@ class MainFrame(wx.Frame):
         save_pack_log(self.pack_log)
         wx.CallAfter(self.refresh_mgmt)
         wx.CallAfter(self.refresh_log_page)
-
-        # 根据设置决定是否显示浮窗
         if self.settings.get('show_toast', True):
             bottom_margin = self.settings.get('toast_bottom_margin', 70)
             def undo_action():
@@ -1450,13 +1295,9 @@ class MainFrame(wx.Frame):
                 except ValueError:
                     pass
                 self.pack_log.append({
-                    "account": acc,
-                    "cid": cid,
-                    "name": cw_name,
-                    "pack_time": int(time.time() * 1000),
-                    "output_path": out_path,
-                    "skipped": True,
-                    "undo": True
+                    "account": acc, "cid": cid, "name": cw_name,
+                    "pack_time": int(time.time() * 1000), "output_path": out_path,
+                    "skipped": True, "undo": True
                 })
                 self.skip_cids.add(f"{acc}|{cid}")
                 self.settings["skip_cids"] = list(self.skip_cids)
@@ -1464,28 +1305,22 @@ class MainFrame(wx.Frame):
                 save_pack_log(self.pack_log)
                 wx.CallAfter(self.refresh_mgmt)
                 wx.CallAfter(self.refresh_log_page)
-
             dir_name = os.path.basename(os.path.dirname(out_path))
             wx.CallAfter(ToastNotification, self,
                          f"文件 {os.path.basename(out_path)} 已保存到 {dir_name}",
                          undo_action, bottom_margin=bottom_margin)
 
     def _add_failed_log(self, acc, cid, cw_name, out_path, error_msg):
-        """添加自动打包失败的日志记录"""
         self.pack_log.append({
-            "account": acc,
-            "cid": cid,
-            "name": cw_name,
-            "pack_time": int(time.time() * 1000),
-            "output_path": out_path,
-            "failed": True,
-            "reason": f"自动打包异常: {error_msg}"
+            "account": acc, "cid": cid, "name": cw_name,
+            "pack_time": int(time.time() * 1000), "output_path": out_path,
+            "failed": True, "reason": f"自动打包异常: {error_msg}"
         })
         save_pack_log(self.pack_log)
         wx.CallAfter(self.refresh_mgmt)
         wx.CallAfter(self.refresh_log_page)
 
-    # ---------- 关于页面 ----------
+    # ---- 关于页面 ----
     def init_about_page(self):
         panel = self.about_panel
         main_sz = wx.BoxSizer(wx.VERTICAL)
@@ -1504,9 +1339,9 @@ class MainFrame(wx.Frame):
         main_sz.Add(desc, 0, wx.ALIGN_CENTER | wx.ALL, 10)
         features = ["📦 课件打包为 ENBX 格式", "📁 按账户自动转存到指定目录",
                     "⏭️ 支持永久跳过不需要的课件", "🧹 打包记录去重与撤销",
-                    "📊 最近课件快速预览",
-                    "🔍 文件完整性校验",
-                    "💾 可选备份配置及未使用文件"]
+                    "📊 最近课件快速预览", "🔍 文件完整性校验",
+                    "💾 可选备份配置及未使用文件",
+                    "🧰 Dependencies 清理与弹窗关闭"]
         for text in features:
             main_sz.Add(wx.StaticText(panel, label=text), 0, wx.ALIGN_CENTER | wx.ALL, 2)
         main_sz.AddStretchSpacer()
@@ -1515,22 +1350,20 @@ class MainFrame(wx.Frame):
         main_sz.Add(copyright_info, 0, wx.ALIGN_CENTER | wx.BOTTOM, 15)
         panel.SetSizer(main_sz)
 
-    # ---------- 窗口关闭与退出 ----------
+    # ---- 窗口关闭 ----
     def on_close(self, event):
-        """关闭窗口时隐藏到托盘，而不是退出程序"""
         self.Hide()
 
     def on_real_exit(self, event):
-        """真正的退出操作"""
         self.monitor_timer.Stop()
         self.tray_icon.RemoveIcon()
         self.Destroy()
         wx.GetApp().ExitMainLoop()
 
-
+# ---- 程序入口 ----
 if __name__ == '__main__':
     try:
-        ctypes.windll.shcore.SetProcessDpiAwareness(2)  # PROCESS_PER_MONITOR_DPI_AWARE
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)
     except:
         try:
             ctypes.windll.user32.SetProcessDPIAware()
