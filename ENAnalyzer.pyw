@@ -10,7 +10,6 @@ ENAnalyzer - 希沃白板课件自动打包与管理工具
 import os
 import json
 import shutil
-import zipfile
 import time
 import threading
 import subprocess
@@ -19,9 +18,6 @@ import re
 import sys
 import wx
 import wx.adv
-import hashlib
-from xml.etree.ElementTree import Element, SubElement, tostring
-from xml.dom import minidom
 
 # 导入公共模块
 from Common import (
@@ -31,165 +27,13 @@ from Common import (
     DEFAULT_DATA_DIR, load_settings, save_settings
 )
 from FunctionTab import FunctionTabPanel
+from PackQueue import (
+    JOB_PENDING, JOB_RUNNING, JOB_SUCCESS, JOB_FAILED, JOB_CANCELLED,
+    EVENT_QUEUED, EVENT_STARTED, EVENT_PROGRESS, EVENT_FINISHED, EVENT_IDLE,
+    PackJob, PackQueue, scan_data_dir
+)
 
 SILENT_MODE = "-silent" in sys.argv
-
-def parse_courseware_json(json_path):
-    """解析希沃课件 JSON 文件，返回 (课件信息字典, 文件列表)"""
-    try:
-        with open(json_path, 'r', encoding='utf-8-sig') as f:
-            data = json.load(f)
-    except Exception:
-        return None, []
-    return data.get('Courseware', {}), data.get('CoursewareFiles', [])
-
-def validate_files(files, courseware_dir, enable_checksum=True):
-    """校验文件完整性"""
-    invalid = []
-    for f in files:
-        filename = f['FileName']
-        filepath = os.path.join(courseware_dir, filename)
-        if not os.path.exists(filepath):
-            invalid.append((filename, "文件不存在"))
-            continue
-        partial_state = f.get('FilePartialState', 0)
-        if partial_state != 0:
-            invalid.append((filename, f"文件未下载完全 (PartialState={partial_state})"))
-            continue
-        expected_size = f.get('FileSize', -1)
-        if expected_size != -1:
-            actual_size = os.path.getsize(filepath)
-            if actual_size != expected_size:
-                invalid.append((filename, f"文件大小不匹配 (期望{expected_size}, 实际{actual_size})"))
-                continue
-        if enable_checksum:
-            expected_hash = f.get('FileHash', '')
-            if expected_hash:
-                hasher = hashlib.md5()
-                try:
-                    with open(filepath, 'rb') as fh:
-                        while True:
-                            chunk = fh.read(65536)
-                            if not chunk:
-                                break
-                            hasher.update(chunk)
-                    if hasher.hexdigest().lower() != expected_hash.lower():
-                        invalid.append((filename, "文件哈希不匹配"))
-                except Exception as e:
-                    invalid.append((filename, f"读取文件出错: {e}"))
-    return invalid
-
-def generate_config_xml(files, output_dir):
-    """生成 Open XML 格式的 [Content_Types].xml 文件"""
-    extensions = set()
-    overrides = []
-    for item in files:
-        fname = item['FileName']
-        rel = item['RelativePath']
-        if '.' in fname:
-            ext = fname.rsplit('.', 1)[-1]
-            if ext.lower() != 'xml':
-                extensions.add(ext)
-        overrides.append('/' + rel.replace('\\', '/'))
-    ns = 'http://schemas.openxmlformats.org/package/2006/content-types'
-    root = Element('Types', xmlns=ns)
-    for ext in sorted(extensions):
-        SubElement(root, 'Default', Extension=ext, ContentType='')
-    for part in overrides:
-        SubElement(root, 'Override', PartName=part, ContentType='')
-    xml_bytes = minidom.parseString(tostring(root, 'utf-8')).toprettyxml(indent='  ', encoding='utf-8')
-    xml_str = xml_bytes.decode('utf-8')
-    output = '\n'.join([line for line in xml_str.splitlines() if line.strip()])
-    xml_path = os.path.join(output_dir, '[Content_Types].xml')
-    with open(xml_path, 'w', encoding='utf-8') as f:
-        f.write(output)
-    return xml_path
-
-def pack_courseware(courseware_dir, json_name, output_path, progress_callback=None,
-                    backup_config=False, backup_unused=False):
-    """将课件目录打包为 ENBX 文件"""
-    json_path = os.path.join(courseware_dir, json_name)
-    if not os.path.exists(json_path):
-        raise FileNotFoundError(f"JSON 文件不存在: {json_path}")
-    info, files = parse_courseware_json(json_path)
-    if info is None:
-        raise ValueError("JSON 解析失败")
-    temp_dir = os.path.join(os.path.dirname(output_path), f"__temp_{time.time_ns()}")
-    os.makedirs(temp_dir, exist_ok=True)
-    # 复制文件
-    for idx, f in enumerate(files):
-        src = os.path.join(courseware_dir, f['FileName'])
-        dst = os.path.join(temp_dir, f['RelativePath'].replace('/', os.sep))
-        os.makedirs(os.path.dirname(dst), exist_ok=True)
-        try:
-            shutil.copy2(src, dst)
-        except Exception as e:
-            if progress_callback:
-                wx.CallAfter(progress_callback, f"⚠️ {f['FileName']} 复制失败: {e}")
-        if progress_callback:
-            wx.CallAfter(progress_callback, int((idx + 1) / len(files) * 50))
-    generate_config_xml(files, temp_dir)
-
-    # 备份到 dist/
-    do_config_backup = backup_config or backup_unused
-    if do_config_backup:
-        dist_dir = os.path.join(temp_dir, 'dist')
-        os.makedirs(dist_dir, exist_ok=True)
-        try:
-            shutil.copy2(json_path, os.path.join(dist_dir, json_name))
-        except Exception as e:
-            if progress_callback:
-                wx.CallAfter(progress_callback, f"⚠️ 配置 JSON 备份失败: {e}")
-
-    if backup_unused:
-        used_names = {f['FileName'] for f in files}
-        for item in os.listdir(courseware_dir):
-            item_path = os.path.join(courseware_dir, item)
-            if not os.path.isfile(item_path):
-                continue
-            if item not in used_names:
-                try:
-                    shutil.copy2(item_path, os.path.join(dist_dir, item))
-                except Exception as e:
-                    if progress_callback:
-                        wx.CallAfter(progress_callback, f"⚠️ 未使用文件备份失败 ({item}): {e}")
-
-    # 打包为 ZIP
-    with zipfile.ZipFile(output_path, 'w', zipfile.ZIP_DEFLATED) as zf:
-        for root, _, files_in in os.walk(temp_dir):
-            for fn in files_in:
-                abs_path = os.path.join(root, fn)
-                zf.write(abs_path, os.path.relpath(abs_path, temp_dir))
-    shutil.rmtree(temp_dir, ignore_errors=True)
-    if progress_callback:
-        wx.CallAfter(progress_callback, 100)
-    return output_path
-
-def scan_data_dir(data_dir):
-    """扫描希沃数据目录，返回结构：{ 账户ID: { 课件ID: (课件信息, 文件列表, 课件目录路径) } }"""
-    result = {}
-    if not os.path.isdir(data_dir):
-        return result
-    for acc in os.listdir(data_dir):
-        acc_dir = os.path.join(data_dir, acc)
-        if not os.path.isdir(acc_dir):
-            continue
-        cw_root = os.path.join(acc_dir, 'Courseware')
-        if not os.path.isdir(cw_root):
-            continue
-        cw_dict = {}
-        for cid in os.listdir(cw_root):
-            cid_dir = os.path.join(cw_root, cid)
-            if not os.path.isdir(cid_dir):
-                continue
-            json_path = os.path.join(cid_dir, f"{cid}.json")
-            if os.path.isfile(json_path):
-                info, files = parse_courseware_json(json_path)
-                if info is not None:
-                    cw_dict[cid] = (info, files, cid_dir)
-        if cw_dict:
-            result[acc] = cw_dict
-    return result
 
 def load_pack_log():
     """加载打包历史记录"""
@@ -340,6 +184,7 @@ class MainFrame(wx.Frame):
         self.notebook = wx.Notebook(self)
         self.home_panel = wx.Panel(self.notebook)
         self.mgmt_panel = wx.Panel(self.notebook)
+        self.queue_panel = wx.Panel(self.notebook)
         self.log_panel = wx.Panel(self.notebook)
         self.settings_panel = wx.Panel(self.notebook)
         self.about_panel = wx.Panel(self.notebook)
@@ -349,6 +194,7 @@ class MainFrame(wx.Frame):
 
         self.notebook.AddPage(self.home_panel, "首页")
         self.notebook.AddPage(self.mgmt_panel, "课件管理")
+        self.notebook.AddPage(self.queue_panel, "打包队列")
         self.notebook.AddPage(self.log_panel, "打包记录")
         self.notebook.AddPage(self.settings_panel, "转存设置")
         self.notebook.AddPage(self.function_panel, "功能设置")   # 新页面
@@ -356,9 +202,16 @@ class MainFrame(wx.Frame):
 
         self.init_home_page()
         self.init_mgmt_page()
+        self.init_queue_page()
         self.init_log_page()
         self.init_settings_page()
         self.init_about_page()
+
+        # 后台打包队列（打包逻辑与界面分离，任务串行执行）
+        self._monitor_scan_running = False
+        self._pack_batches = {}
+        self._batch_seq = 0
+        self.pack_queue = PackQueue(callback=self._on_pack_queue_event)
 
         self.Bind(wx.EVT_CLOSE, self.on_close)
         self.tray_icon = TaskBarIcon(self)
@@ -540,6 +393,7 @@ class MainFrame(wx.Frame):
                 card_sz.Add(status_sz, 0, wx.ALL | wx.EXPAND, 8)
 
                 card.SetSizer(card_sz)
+                self._bind_open_dblclick(card, item)
                 grid_sz.Add(card, 0, wx.EXPAND | wx.ALL, 0)
 
             for _ in range(len(top6), 6):
@@ -550,6 +404,233 @@ class MainFrame(wx.Frame):
         self.home_scroll.SetSizer(sz)
         self.home_scroll.Layout()
         self.home_scroll.SetVirtualSize(sz.GetMinSize())
+
+    # ---- 双击打开课件 ----
+    def _bind_open_dblclick(self, ctrl, item):
+        """为首页卡片及其所有子控件绑定双击打开事件"""
+        if not hasattr(self, '_cursor_hand'):
+            self._cursor_hand = wx.Cursor(wx.CURSOR_HAND)
+        ctrl.Bind(wx.EVT_LEFT_DCLICK, lambda e, it=item: self.on_home_card_dblclick(it))
+        try:
+            ctrl.SetCursor(self._cursor_hand)
+            ctrl.SetToolTip("双击打开课件")
+        except Exception:
+            pass
+        for child in ctrl.GetChildren():
+            self._bind_open_dblclick(child, item)
+
+    def on_home_card_dblclick(self, item):
+        path = self._find_latest_output(item['acc'], item['cid'])
+        if not path:
+            wx.MessageBox(f"课件“{item['name']}”尚未打包，无法打开。\n请先在“课件管理”中打包该课件。",
+                          "无法打开", wx.ICON_INFORMATION)
+            return
+        self._confirm_open_file(item['name'], path)
+
+    def _find_latest_output(self, acc, cid):
+        """查找该课件最近一次有效打包的输出路径"""
+        recs = [rec for rec in self.pack_log
+                if rec.get('account') == acc and rec.get('cid') == cid
+                and rec.get('output_path') and not rec.get('failed') and not rec.get('skipped')]
+        if not recs:
+            return None
+        return max(recs, key=lambda r: r.get('pack_time', 0)).get('output_path')
+
+    def _confirm_open_file(self, name, path):
+        if not path or not os.path.exists(path):
+            wx.MessageBox(f"未找到可打开的打包文件：\n{path or '(空)'}", "无法打开", wx.ICON_WARNING)
+            return
+        dlg = wx.MessageDialog(self, f"是否打开课件“{name}”？\n\n{path}", "打开课件",
+                               wx.YES_NO | wx.NO_DEFAULT | wx.ICON_QUESTION)
+        ok = dlg.ShowModal() == wx.ID_YES
+        dlg.Destroy()
+        if ok:
+            self._open_file(path)
+
+    def _open_file(self, path):
+        try:
+            os.startfile(path)
+        except Exception as e:
+            wx.MessageBox(f"打开失败: {e}", "错误", wx.ICON_ERROR)
+
+    # ---- 打包队列 ----
+    def init_queue_page(self):
+        sz = wx.BoxSizer(wx.VERTICAL)
+        top = wx.BoxSizer(wx.HORIZONTAL)
+        self.queue_summary = wx.StaticText(self.queue_panel, label="队列空闲")
+        top.Add(self.queue_summary, 1, wx.ALIGN_CENTER_VERTICAL | wx.ALL, 5)
+        btn_clear = wx.Button(self.queue_panel, label="清空已完成任务")
+        btn_clear.Bind(wx.EVT_BUTTON, self.on_clear_finished_queue)
+        top.Add(btn_clear, 0, wx.ALL, 5)
+        sz.Add(top, 0, wx.EXPAND | wx.ALL, 5)
+
+        self.queue_list = wx.ListCtrl(self.queue_panel, style=wx.LC_REPORT)
+        for col, width in [("状态", 80), ("课件名称", 220), ("账户", 110),
+                           ("来源", 60), ("进度", 70), ("说明", 220), ("输出路径", 300)]:
+            self.queue_list.InsertColumn(self.queue_list.GetColumnCount(), col, width=width)
+        sz.Add(self.queue_list, 1, wx.EXPAND | wx.ALL, 10)
+        self.queue_panel.SetSizer(sz)
+
+        self.queue_jobs = []
+        self.queue_row_map = {}
+
+    def _on_pack_queue_event(self, event, job):
+        """队列回调运行于后台线程，统一切回界面线程处理"""
+        wx.CallAfter(self._handle_pack_queue_event, event, job)
+
+    def _handle_pack_queue_event(self, event, job):
+        if event in (EVENT_QUEUED, EVENT_STARTED):
+            self._update_queue_row(job)
+            self._update_queue_summary()
+        elif event == EVENT_PROGRESS:
+            self._update_queue_row(job)
+            if job is self.pack_queue.current_job:
+                self.mgmt_gauge.SetValue(max(0, min(100, job.progress)))
+        elif event == EVENT_FINISHED:
+            self._update_queue_row(job)
+            self._update_queue_summary()
+            self._update_mgmt_status_for_job(job)
+            self._handle_pack_finished(job)
+        elif event == EVENT_IDLE:
+            self._update_queue_summary()
+            self.mgmt_gauge.SetValue(0)
+            self.refresh_log_page()
+            self.refresh_mgmt()
+
+    def _update_queue_row(self, job):
+        row = self.queue_row_map.get(job)
+        if row is None:
+            row = self.queue_list.GetItemCount()
+            self.queue_list.InsertItem(row, "")
+            self.queue_row_map[job] = row
+            self.queue_jobs.append(job)
+        status_map = {
+            JOB_PENDING: ("等待中", wx.Colour(128, 128, 128)),
+            JOB_RUNNING: ("打包中", wx.Colour(0, 120, 215)),
+            JOB_SUCCESS: ("完成", wx.GREEN),
+            JOB_FAILED: ("失败", wx.RED),
+            JOB_CANCELLED: ("已取消", wx.Colour(128, 128, 128)),
+        }
+        status_text, color = status_map.get(job.status, (job.status, wx.BLACK))
+        self.queue_list.SetItem(row, 0, status_text)
+        self.queue_list.SetItem(row, 1, job.name)
+        self.queue_list.SetItem(row, 2, job.acc)
+        self.queue_list.SetItem(row, 3, "手动" if job.source == "manual" else "自动")
+        self.queue_list.SetItem(row, 4, f"{max(0, min(100, job.progress))}%")
+        self.queue_list.SetItem(row, 5, job.message)
+        self.queue_list.SetItem(row, 6, job.out_path)
+        self.queue_list.SetItemTextColour(row, color)
+
+    def _update_queue_summary(self):
+        pending = self.pack_queue.pending_count()
+        running = self.pack_queue.running_count()
+        if running:
+            label = f"正在打包 {running} 个，等待 {pending} 个"
+        elif pending:
+            label = f"等待打包 {pending} 个"
+        else:
+            label = "队列空闲"
+        total = len(self.queue_jobs)
+        if total:
+            label += f"（本次共 {total} 个任务）"
+        self.queue_summary.SetLabel(label)
+
+    def on_clear_finished_queue(self, event):
+        keep = [j for j in self.queue_jobs if j.status in (JOB_PENDING, JOB_RUNNING)]
+        self.queue_list.DeleteAllItems()
+        self.queue_jobs = []
+        self.queue_row_map = {}
+        for job in keep:
+            self._update_queue_row(job)
+        self._update_queue_summary()
+
+    def _update_mgmt_status_for_job(self, job):
+        """任务完成后仅刷新对应行状态，避免整表重新扫描"""
+        for row, item in enumerate(self.mgmt_data):
+            if item['acc'] == job.acc and item['cid'] == job.cid:
+                item['status'] = self.get_pack_status(job.acc, job.cid, item['mtime'])
+                status_text, color = item['status']
+                self.mgmt_list.SetItem(row, 6, status_text)
+                self.mgmt_list.SetItemTextColour(row, color)
+                break
+
+    def _handle_pack_finished(self, job):
+        # 自动任务只要通过完整性校验，就应清除失败计数（与原逻辑一致）
+        if job.source == "auto" and job.failure_kind != "validation":
+            self._on_auto_validation_success(job.acc, job.cid)
+        if job.status == JOB_SUCCESS:
+            record = {
+                "account": job.acc, "cid": job.cid, "name": job.log_name,
+                "pack_time": int(time.time() * 1000), "output_path": job.out_path
+            }
+            self.pack_log.append(record)
+            save_pack_log(self.pack_log)
+            self.refresh_log_page()
+            if job.source == "auto":
+                self._update_last_pack_state(job.acc, job.cid, job.json_mtime)
+                self._show_pack_toast(job, record)
+            self._mark_batch_done(job, success=True)
+            return
+        if job.status == JOB_CANCELLED:
+            self._mark_batch_done(job, success=False)
+            return
+        if job.failure_kind == "validation":
+            if job.source == "auto":
+                self._on_auto_validation_fail(job.acc, job.cid, job.name)
+            else:
+                details = "\n".join(f"{f}: {r}" for f, r in job.invalid_files)
+                wx.MessageBox(f"课件“{job.name}”文件不完整，跳过打包：\n{details}", "校验失败", wx.ICON_ERROR)
+        else:
+            if job.source == "auto":
+                self._add_failed_log(job.acc, job.cid, job.name, job.out_path, job.message)
+            else:
+                wx.MessageBox(f"打包失败 {os.path.basename(job.out_path)}: {job.message}", "错误", wx.ICON_ERROR)
+        self._mark_batch_done(job, success=False)
+
+    def _mark_batch_done(self, job, success):
+        batch_id = job.batch_id
+        if batch_id is None:
+            return
+        batch = self._pack_batches.get(batch_id)
+        if not batch:
+            return
+        batch['done'] += 1
+        if not success:
+            batch['failed'].append(job.name)
+        if batch['done'] >= batch['total']:
+            self._pack_batches.pop(batch_id, None)
+            if batch['failed']:
+                wx.MessageBox("以下课件打包失败:\n" + "\n".join(batch['failed']), "警告", wx.ICON_WARNING)
+
+    def _show_pack_toast(self, job, record):
+        if not self.settings.get('show_toast', True):
+            return
+        out_path = job.out_path
+        acc, cid, cw_name = job.acc, job.cid, job.name
+
+        def undo_action():
+            if os.path.exists(out_path):
+                os.remove(out_path)
+            try:
+                self.pack_log.remove(record)
+            except ValueError:
+                pass
+            self.pack_log.append({
+                "account": acc, "cid": cid, "name": cw_name,
+                "pack_time": int(time.time() * 1000), "output_path": out_path,
+                "skipped": True, "undo": True
+            })
+            self.skip_cids.add(f"{acc}|{cid}")
+            self.settings["skip_cids"] = list(self.skip_cids)
+            save_settings(self.settings)
+            save_pack_log(self.pack_log)
+            wx.CallAfter(self.refresh_mgmt)
+            wx.CallAfter(self.refresh_log_page)
+
+        dir_name = os.path.basename(os.path.dirname(out_path))
+        bottom_margin = self.settings.get('toast_bottom_margin', 70)
+        ToastNotification(self, f"文件 {os.path.basename(out_path)} 已保存到 {dir_name}",
+                          undo_action, bottom_margin=bottom_margin)
 
     # ---- 课件管理 ----
     def init_mgmt_page(self):
@@ -585,6 +666,7 @@ class MainFrame(wx.Frame):
             self.mgmt_list.InsertColumn(self.mgmt_list.GetColumnCount(), col, width=width)
         self.mgmt_list.Bind(wx.EVT_LIST_COL_CLICK, self.on_mgmt_col_click)
         self.mgmt_list.Bind(wx.EVT_LEFT_DOWN, self.on_mgmt_left_click)
+        self.mgmt_list.Bind(wx.EVT_LEFT_DCLICK, self.on_mgmt_dblclick)
         main_sz.Add(self.mgmt_list, 1, wx.EXPAND | wx.ALL, 10)
 
         hpack = wx.BoxSizer(wx.HORIZONTAL)
@@ -705,14 +787,30 @@ class MainFrame(wx.Frame):
         else:
             event.Skip()
 
-    @staticmethod
-    def _get_mgmt_clicked_col(x_pos):
-        col_widths = [50, 120, 250, 100, 150, 80, 100]
+    def on_mgmt_dblclick(self, event):
+        """双击课件管理列表：确认后打开对应课件"""
+        row, _ = self.mgmt_list.HitTest(event.GetPosition())
+        if row < 0 or row >= len(self.mgmt_data):
+            event.Skip()
+            return
+        if self._get_mgmt_clicked_col(event.GetX()) == 0:
+            # 勾选列用于勾选，双击不触发打开
+            event.Skip()
+            return
+        item = self.mgmt_data[row]
+        path = self._find_latest_output(item['acc'], item['cid'])
+        if not path:
+            wx.MessageBox(f"课件“{item['name']}”尚未打包，无法打开。\n请先勾选并打包该课件。",
+                          "无法打开", wx.ICON_INFORMATION)
+            return
+        self._confirm_open_file(item['name'], path)
+
+    def _get_mgmt_clicked_col(self, x_pos):
         cur = 0
-        for i, w in enumerate(col_widths):
-            if x_pos < cur + w:
+        for i in range(self.mgmt_list.GetColumnCount()):
+            cur += self.mgmt_list.GetColumnWidth(i)
+            if x_pos < cur:
                 return i
-            cur += w
         return -1
 
     def on_mgmt_search(self, event):
@@ -817,47 +915,45 @@ class MainFrame(wx.Frame):
             return
         output_dir = dlg.GetPath()
         dlg.Destroy()
-        threading.Thread(target=self._do_pack_multiple, args=(list(self.mgmt_selected), output_dir), daemon=True).start()
 
-    def _do_pack_multiple(self, to_pack, output_dir):
-        total = len(to_pack)
-        failed = []
-        enable_checksum = self.settings.get('enable_hash_check', True)
-        backup_config = self.settings.get('backup_config', False)
-        backup_unused = self.settings.get('backup_unused', False)
-        for idx, (acc, cid) in enumerate(to_pack):
-            if acc not in self.courseware_data or cid not in self.courseware_data[acc]:
-                failed.append((acc, cid))
+        self._batch_seq += 1
+        batch_id = self._batch_seq
+        batch = {'total': 0, 'done': 0, 'failed': []}
+        missing = []
+        for acc, cid in list(self.mgmt_selected):
+            job = self._make_pack_job(acc, cid, output_dir, source='manual')
+            if job is None:
+                item = next((d for d in self.mgmt_data if d['acc'] == acc and d['cid'] == cid), None)
+                missing.append(item['name'] if item else cid)
                 continue
-            info, files, cw_dir = self.courseware_data[acc][cid]
-            invalid_files = validate_files(files, cw_dir, enable_checksum)
-            if invalid_files:
-                msg = f"课件“{info.get('Name')}”文件不完整，跳过打包：\n"
-                msg += "\n".join([f"{f}: {r}" for f, r in invalid_files])
-                wx.CallAfter(wx.MessageBox, msg, "校验失败", wx.ICON_ERROR)
-                failed.append((acc, cid))
-                continue
-            json_name = f"{cid}.json"
-            enbx_name = sanitize_filename(self._safe_str(info.get('Name')), cid) + '.enbx'
-            out_path = os.path.join(self.account_paths.get(acc, output_dir), enbx_name)
-            os.makedirs(os.path.dirname(out_path), exist_ok=True)
-            try:
-                pack_courseware(cw_dir, json_name, out_path,
-                                progress_callback=lambda v: isinstance(v, int) and wx.CallAfter(self.mgmt_gauge.SetValue, v),
-                                backup_config=backup_config, backup_unused=backup_unused)
-                self.pack_log.append({
-                    "account": acc, "cid": cid, "name": enbx_name,
-                    "pack_time": int(time.time() * 1000), "output_path": out_path
-                })
-                save_pack_log(self.pack_log)
-            except Exception as e:
-                failed.append((acc, cid))
-                wx.CallAfter(wx.MessageBox, f"打包失败 {enbx_name}: {e}", "错误", wx.ICON_ERROR)
-            wx.CallAfter(self.mgmt_gauge.SetValue, int((idx + 1) / total * 100))
-        if failed:
-            wx.CallAfter(wx.MessageBox, f"以下课件打包失败: {failed}", "警告", wx.ICON_WARNING)
-        wx.CallAfter(self.refresh_mgmt)
-        wx.CallAfter(self.refresh_log_page)
+            job.batch_id = batch_id
+            if self.pack_queue.add_job(job):
+                batch['total'] += 1
+        if batch['total'] == 0:
+            if missing:
+                wx.MessageBox("以下课件已不存在，无法打包:\n" + "\n".join(missing), "提示", wx.ICON_WARNING)
+            else:
+                wx.MessageBox("所选课件已在打包队列中", "提示", wx.ICON_INFORMATION)
+            return
+        batch['failed'].extend(missing)
+        self._pack_batches[batch_id] = batch
+
+    def _make_pack_job(self, acc, cid, output_dir, source):
+        """根据当前课件数据创建打包任务（不执行打包）"""
+        if acc not in self.courseware_data or cid not in self.courseware_data[acc]:
+            return None
+        info, files, cw_dir = self.courseware_data[acc][cid]
+        name = self._safe_str(info.get('Name'))
+        enbx_name = sanitize_filename(name, cid) + '.enbx'
+        out_path = os.path.join(self.account_paths.get(acc) or output_dir, enbx_name)
+        return PackJob(
+            acc=acc, cid=cid, name=name, cw_dir=cw_dir, json_name=f"{cid}.json",
+            out_path=out_path, files=files,
+            enable_checksum=self.settings.get('enable_hash_check', True),
+            backup_config=self.settings.get('backup_config', False),
+            backup_unused=self.settings.get('backup_unused', False),
+            source=source, log_name=(enbx_name if source == 'manual' else name)
+        )
 
     # ---- 打包记录 ----
     def init_log_page(self):
@@ -865,6 +961,7 @@ class MainFrame(wx.Frame):
         self.log_list = wx.ListCtrl(self.log_panel, style=wx.LC_REPORT)
         for col, width in [("账户", 120), ("课件名称", 250), ("打包时间/状态", 160), ("输出路径", 300)]:
             self.log_list.InsertColumn(self.log_list.GetColumnCount(), col, width=width)
+        self.log_list.Bind(wx.EVT_LIST_ITEM_ACTIVATED, self.on_log_item_activated)
         btn_sz = wx.BoxSizer(wx.HORIZONTAL)
         for label, handler in [("删除选中记录", self.on_delete_log),
                                ("去除重复记录", self.on_remove_duplicates),
@@ -891,6 +988,19 @@ class MainFrame(wx.Frame):
             else:
                 self.log_list.SetItem(row, 2, time.strftime("%Y-%m-%d %H:%M", time.localtime(rec['pack_time'] / 1000)))
             self.log_list.SetItem(row, 3, rec.get('output_path', ''))
+
+    def on_log_item_activated(self, event):
+        """双击打包记录：确认后打开对应课件"""
+        idx = event.GetIndex()
+        if idx < 0 or idx >= len(self.pack_log):
+            return
+        rec = self.pack_log[idx]
+        path = rec.get('output_path') or ''
+        name = rec.get('name') or rec.get('cid') or '课件'
+        if not path:
+            wx.MessageBox("该记录没有可打开的文件（可能为跳过或失败记录）。", "无法打开", wx.ICON_INFORMATION)
+            return
+        self._confirm_open_file(name, path)
 
     def on_remove_duplicates(self, event):
         if not self.pack_log:
@@ -1203,31 +1313,63 @@ class MainFrame(wx.Frame):
 
     # ---- 自动打包监控 ----
     def on_monitor_tick(self, event):
-        if not self.auto_pack_enabled:
+        if not self.auto_pack_enabled or self._monitor_scan_running:
             return
         if not hasattr(self, '_last_pack_state'):
             self._last_pack_state = {}
-        new_data = scan_data_dir(self.monitor_dir)
+        self._monitor_scan_running = True
+        # 目录扫描放到后台线程，避免定时任务卡住界面
+        threading.Thread(
+            target=self._monitor_scan_worker,
+            args=(self.monitor_dir, set(self.skip_cids), list(self.pack_log)),
+            daemon=True
+        ).start()
+
+    def _monitor_scan_worker(self, monitor_dir, skip_cids, pack_log):
+        try:
+            new_data = scan_data_dir(monitor_dir)
+        except Exception:
+            new_data = {}
+        wx.CallAfter(self._process_monitor_scan, new_data, skip_cids, pack_log)
+
+    def _process_monitor_scan(self, new_data, skip_cids, pack_log):
+        """根据扫描结果将需要打包的课件加入后台队列"""
+        self._monitor_scan_running = False
+        if not self.auto_pack_enabled:
+            return
         enable_checksum = self.settings.get('enable_hash_check', True)
         backup_config = self.settings.get('backup_config', False)
         backup_unused = self.settings.get('backup_unused', False)
+        # 预先按课件汇总最新打包时间，避免逐个课件遍历整份历史记录
+        latest_times = {}
+        for rec in pack_log:
+            key = (rec.get('account'), rec.get('cid'))
+            t = rec.get('pack_time', 0)
+            if t > latest_times.get(key, -1):
+                latest_times[key] = t
         for acc, cw_dict in new_data.items():
             for cid, (info, files, cid_dir) in cw_dict.items():
-                if f"{acc}|{cid}" in self.skip_cids:
+                if f"{acc}|{cid}" in skip_cids:
                     continue
                 key = f"{acc}_{cid}"
                 json_mtime = info.get('UpdateTime', 0) / 1000.0
-                latest = max((rec for rec in self.pack_log if rec['account'] == acc and rec['cid'] == cid),
-                             key=lambda x: x['pack_time'], default=None)
-                if latest is None or json_mtime > latest['pack_time'] / 1000.0:
-                    if key not in self._last_pack_state or self._last_pack_state[key] < json_mtime:
-                        safe_name = sanitize_filename(self._safe_str(info.get('Name')), cid) + '.enbx'
-                        out_dir = self.account_paths.get(acc) or (os.path.join(self.output_root, acc) if self.by_account else self.output_root)
-                        os.makedirs(out_dir, exist_ok=True)
-                        out_path = os.path.join(out_dir, safe_name)
-                        threading.Thread(target=self._auto_pack_thread,
-                                         args=(cid_dir, f"{cid}.json", out_path, acc, cid, json_mtime, files, enable_checksum, info, backup_config, backup_unused),
-                                         daemon=True).start()
+                latest_time = latest_times.get((acc, cid))
+                if latest_time is not None and json_mtime <= latest_time / 1000.0:
+                    continue
+                if key in self._last_pack_state and self._last_pack_state[key] >= json_mtime:
+                    continue
+                cw_name = self._safe_str(info.get('Name'))
+                safe_name = sanitize_filename(cw_name, cid) + '.enbx'
+                out_dir = self.account_paths.get(acc) or \
+                    (os.path.join(self.output_root, acc) if self.by_account else self.output_root)
+                out_path = os.path.join(out_dir, safe_name)
+                job = PackJob(
+                    acc=acc, cid=cid, name=cw_name, cw_dir=cid_dir, json_name=f"{cid}.json",
+                    out_path=out_path, files=files, enable_checksum=enable_checksum,
+                    backup_config=backup_config, backup_unused=backup_unused,
+                    source='auto', log_name=cw_name, json_mtime=json_mtime
+                )
+                self.pack_queue.add_job(job)
 
     def _on_auto_validation_fail(self, acc, cid, cw_name):
         key = f"{acc}_{cid}"
@@ -1248,8 +1390,6 @@ class MainFrame(wx.Frame):
         self.settings["skip_cids"] = list(self.skip_cids)
         self.settings["fail_counts"] = self.fail_counts
         save_settings(self.settings)
-        wx.CallAfter(self.refresh_mgmt)
-        wx.CallAfter(self.refresh_log_page)
 
     def _on_auto_validation_success(self, acc, cid):
         key = f"{acc}_{cid}"
@@ -1264,52 +1404,6 @@ class MainFrame(wx.Frame):
             self._last_pack_state = {}
         self._last_pack_state[key] = mtime
 
-    def _auto_pack_thread(self, cw_dir, json_name, out_path, acc, cid, json_mtime, files, enable_checksum, info, backup_config, backup_unused):
-        cw_name = self._safe_str(info.get('Name', '') if info else '')
-        invalid = validate_files(files, cw_dir, enable_checksum)
-        if invalid:
-            wx.CallAfter(self._on_auto_validation_fail, acc, cid, cw_name)
-            return
-        wx.CallAfter(self._on_auto_validation_success, acc, cid)
-        try:
-            pack_courseware(cw_dir, json_name, out_path, backup_config=backup_config, backup_unused=backup_unused)
-        except Exception as e:
-            wx.CallAfter(self._add_failed_log, acc, cid, cw_name, out_path, str(e))
-            return
-        wx.CallAfter(self._update_last_pack_state, acc, cid, json_mtime)
-        pack_record = {
-            "account": acc, "cid": cid, "name": cw_name,
-            "pack_time": int(time.time() * 1000), "output_path": out_path
-        }
-        self.pack_log.append(pack_record)
-        save_pack_log(self.pack_log)
-        wx.CallAfter(self.refresh_mgmt)
-        wx.CallAfter(self.refresh_log_page)
-        if self.settings.get('show_toast', True):
-            bottom_margin = self.settings.get('toast_bottom_margin', 70)
-            def undo_action():
-                if os.path.exists(out_path):
-                    os.remove(out_path)
-                try:
-                    self.pack_log.remove(pack_record)
-                except ValueError:
-                    pass
-                self.pack_log.append({
-                    "account": acc, "cid": cid, "name": cw_name,
-                    "pack_time": int(time.time() * 1000), "output_path": out_path,
-                    "skipped": True, "undo": True
-                })
-                self.skip_cids.add(f"{acc}|{cid}")
-                self.settings["skip_cids"] = list(self.skip_cids)
-                save_settings(self.settings)
-                save_pack_log(self.pack_log)
-                wx.CallAfter(self.refresh_mgmt)
-                wx.CallAfter(self.refresh_log_page)
-            dir_name = os.path.basename(os.path.dirname(out_path))
-            wx.CallAfter(ToastNotification, self,
-                         f"文件 {os.path.basename(out_path)} 已保存到 {dir_name}",
-                         undo_action, bottom_margin=bottom_margin)
-
     def _add_failed_log(self, acc, cid, cw_name, out_path, error_msg):
         self.pack_log.append({
             "account": acc, "cid": cid, "name": cw_name,
@@ -1317,7 +1411,6 @@ class MainFrame(wx.Frame):
             "failed": True, "reason": f"自动打包异常: {error_msg}"
         })
         save_pack_log(self.pack_log)
-        wx.CallAfter(self.refresh_mgmt)
         wx.CallAfter(self.refresh_log_page)
 
     # ---- 关于页面 ----
@@ -1356,6 +1449,7 @@ class MainFrame(wx.Frame):
 
     def on_real_exit(self, event):
         self.monitor_timer.Stop()
+        self.pack_queue.stop()
         self.tray_icon.RemoveIcon()
         self.Destroy()
         wx.GetApp().ExitMainLoop()
