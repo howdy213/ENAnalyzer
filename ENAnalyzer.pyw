@@ -186,7 +186,8 @@ class MainFrame(wx.Frame):
         self.mgmt_panel = wx.Panel(self.notebook)
         self.queue_panel = wx.Panel(self.notebook)
         self.log_panel = wx.Panel(self.notebook)
-        self.settings_panel = wx.Panel(self.notebook)
+        # 设置页内容较多，使用可滚动面板，系统缩放时可上下滚动查看
+        self.settings_panel = wx.ScrolledWindow(self.notebook, style=wx.VSCROLL)
         self.about_panel = wx.Panel(self.notebook)
 
         # 新增功能设置 Tab
@@ -635,9 +636,10 @@ class MainFrame(wx.Frame):
     # ---- 课件管理 ----
     def init_mgmt_page(self):
         main_sz = wx.BoxSizer(wx.VERTICAL)
-        hdir = wx.BoxSizer(wx.HORIZONTAL)
-        hdir.Add(wx.StaticText(self.mgmt_panel, label="Data 目录:"), 0, wx.ALIGN_CENTER_VERTICAL)
-        self.mgmt_dir_text = wx.TextCtrl(self.mgmt_panel, value=self.data_dir, size=(400, -1))
+        # 使用可换行布局：窗口变窄或系统缩放时，按钮自动折行而不是被裁掉
+        hdir = wx.WrapSizer(wx.HORIZONTAL)
+        hdir.Add(wx.StaticText(self.mgmt_panel, label="Data 目录:"), 0, wx.ALIGN_CENTER_VERTICAL | wx.ALL, 5)
+        self.mgmt_dir_text = wx.TextCtrl(self.mgmt_panel, value=self.data_dir, size=(300, -1))
         hdir.Add(self.mgmt_dir_text, 0, wx.ALL, 5)
         btn_browse = wx.Button(self.mgmt_panel, label="浏览...")
         btn_browse.Bind(wx.EVT_BUTTON, self.on_mgmt_browse)
@@ -647,8 +649,8 @@ class MainFrame(wx.Frame):
         hdir.Add(btn_refresh, 0, wx.ALL, 5)
         main_sz.Add(hdir, 0, wx.EXPAND | wx.ALL, 5)
 
-        htools = wx.BoxSizer(wx.HORIZONTAL)
-        htools.Add(wx.StaticText(self.mgmt_panel, label="搜索:"), 0, wx.ALIGN_CENTER_VERTICAL)
+        htools = wx.WrapSizer(wx.HORIZONTAL)
+        htools.Add(wx.StaticText(self.mgmt_panel, label="搜索:"), 0, wx.ALIGN_CENTER_VERTICAL | wx.ALL, 5)
         self.mgmt_search = wx.TextCtrl(self.mgmt_panel, size=(200, -1))
         self.mgmt_search.Bind(wx.EVT_TEXT, self.on_mgmt_search)
         htools.Add(self.mgmt_search, 0, wx.ALL, 5)
@@ -1159,6 +1161,8 @@ class MainFrame(wx.Frame):
         save_btn.Bind(wx.EVT_BUTTON, self.on_save_settings)
         main_sz.Add(save_btn, 0, wx.ALIGN_RIGHT | wx.ALL, 10)
         self.settings_panel.SetSizer(main_sz)
+        self.settings_panel.SetScrollRate(0, 20)
+        self.settings_panel.FitInside()
         self.refresh_account_list()
 
     def on_backup_unused_toggle(self, event):

@@ -6,6 +6,7 @@ import threading
 import wx
 import ctypes
 from ctypes import wintypes
+from wx.lib.scrolledpanel import ScrolledPanel
 
 from Common import CONFIG_DIR, get_active_user_profile
 
@@ -45,8 +46,8 @@ def save_function_settings(settings):
         json.dump(settings, f, indent=2)
 
 
-class FunctionTabPanel(wx.Panel):
-    """希沃白板功能设置 Tab 页（独立配置文件，手动保存）"""
+class FunctionTabPanel(ScrolledPanel):
+    """希沃白板功能设置 Tab 页（独立配置文件，手动保存，内容可滚动）"""
     def __init__(self, parent):
         super().__init__(parent)
         self.func_settings = load_function_settings()
@@ -142,28 +143,40 @@ class FunctionTabPanel(wx.Panel):
         main_sz.Add(btn_save, 0, wx.ALIGN_RIGHT | wx.ALL, 10)
 
         self.SetSizer(main_sz)
+        self.SetupScrolling(scroll_x=True, scroll_y=True, rate_x=20, rate_y=20)
 
     # ==================== 依赖目录管理 ====================
     def refresh_dep_list(self):
         self.dep_list.DeleteAllItems()
-        if not os.path.isdir(self.dep_dir):
-            self.dep_info.SetLabel(f"目录不存在: {self.dep_dir}")
-            return
-        self.dep_info.SetLabel(f"当前目录: {self.dep_dir}")
-        try:
-            items = os.listdir(self.dep_dir)
-        except Exception:
-            items = []
+        dir_exists = os.path.isdir(self.dep_dir)
+        if dir_exists:
+            self.dep_info.SetLabel(f"当前目录: {self.dep_dir}")
+        else:
+            self.dep_info.SetLabel(f"目录不存在（已监视项仍会显示，可在此取消监视）: {self.dep_dir}")
+        items = []
+        if dir_exists:
+            try:
+                items = [n for n in os.listdir(self.dep_dir)
+                         if os.path.isdir(os.path.join(self.dep_dir, n))]
+            except Exception:
+                items = []
         idx = 0
+        existing = set(items)
         for name in items:
-            full_path = os.path.join(self.dep_dir, name)
-            if not os.path.isdir(full_path):
-                continue
             desc = self.descriptions.get(name, "")
             monitored = "是" if name in self.monitor_list else ""
             self.dep_list.InsertItem(idx, name)
             self.dep_list.SetItem(idx, 1, desc)
             self.dep_list.SetItem(idx, 2, monitored)
+            idx += 1
+        # 已监视但目录/数据已被删除的项仍显示出来，便于取消监视
+        for name in sorted(set(self.monitor_list) - existing):
+            desc = self.descriptions.get(name, "")
+            desc = (desc + " " if desc else "") + "（目录已删除）"
+            self.dep_list.InsertItem(idx, name)
+            self.dep_list.SetItem(idx, 1, desc)
+            self.dep_list.SetItem(idx, 2, "是")
+            self.dep_list.SetItemTextColour(idx, wx.Colour(190, 60, 60))
             idx += 1
 
     def on_delete_dep(self, event):

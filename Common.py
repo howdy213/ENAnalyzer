@@ -6,7 +6,7 @@ import re
 import json
 
 APP_NAME = "ENAnalyzer"
-VERSION = "1.0.0"
+VERSION = "1.2.1"
 
 def get_system_root():
     """返回系统盘根目录，例如 C:\\"""
