@@ -77,14 +77,16 @@ class SquareButton(wx.Button):
         self.SetMaxSize((edge, edge))
         self.SetSize((edge, edge))
 
-class ToastNotification(wx.PopupTransientWindow):
-    """浮动通知；on_undo 为 None 时不显示撤销按钮。"""
+class ToastNotification(wx.Frame):
+    """浮动通知；on_undo 为 None 时不显示撤销按钮。
+
+    使用独立置顶窗口而非 PopupTransientWindow：不抢焦点，也不会因失焦立即消失。
+    """
     def __init__(self, parent, message, on_undo=None, timeout=7, bottom_margin=70, on_dismiss=None):
-        super().__init__(parent, flags=wx.BORDER_SIMPLE)
+        super().__init__(None, style=wx.FRAME_NO_TASKBAR | wx.STAY_ON_TOP | wx.BORDER_SIMPLE)
         self.on_undo = on_undo
         self.on_dismiss = on_dismiss
-        self._dismissed = False
-        self.timer = wx.Timer(self)
+        self._closed = False
         self.timeout = timeout
         self.bottom_margin = bottom_margin
 
@@ -108,23 +110,26 @@ class ToastNotification(wx.PopupTransientWindow):
         panel.SetSizer(sz)
         panel.Layout()
 
-        txt_w = msg_text.GetBestSize().width
+        txt_w, txt_h = msg_text.GetBestSize()
         btn_h = btn_close.GetBestSize().height
         total_w = btn_h * (2 if btn_undo else 1) + txt_w + 30 + 60
         total_w = max(total_w, 300)
         screen_w, screen_h = wx.DisplaySize()
         total_w = min(total_w, screen_w - 40)
-        total_h = max(msg_text.GetBestSize().height, btn_h) + 20
+        total_h = max(txt_h, btn_h) + 20
         self.SetSize((total_w, total_h))
         panel.SetSize((total_w, total_h))
 
+        self.timer = wx.Timer(self)
         self.Bind(wx.EVT_TIMER, self.on_timer, self.timer)
         self.timer.Start(1000)
+        self.Bind(wx.EVT_CLOSE, self.on_close)
 
         x = (screen_w - total_w) // 2
         y = screen_h - total_h - self.bottom_margin
         self.SetPosition((x, y))
-        self.Show()
+        # 不激活窗口，避免抢占前台焦点或触发失焦关闭
+        self.ShowWithoutActivating()
 
     def on_undo_click(self, event):
         self.timer.Stop()
@@ -138,11 +143,14 @@ class ToastNotification(wx.PopupTransientWindow):
             self.Dismiss()
 
     def Dismiss(self):
+        self.Close()
+
+    def on_close(self, event):
         self.timer.Stop()
-        super().Dismiss()
-        if self._dismissed:
+        if self._closed:
             return
-        self._dismissed = True
+        self._closed = True
+        self.Destroy()
         if self.on_dismiss:
             self.on_dismiss()
 
@@ -1491,20 +1499,15 @@ def run_toast_mode(message, timeout=7):
         bottom_margin = 70
 
     app = wx.App()
-    owner = wx.Frame(None)
-    owner.Hide()
 
     def finish():
         wx.CallAfter(app.ExitMainLoop)
 
-    ToastNotification(owner, message, on_undo=None, timeout=timeout,
+    ToastNotification(None, message, on_undo=None, timeout=timeout,
                       bottom_margin=bottom_margin, on_dismiss=finish)
     # 兜底计时：浮窗被系统提前关闭时也要保证进程退出
-    guard = wx.Timer(owner)
-    owner.Bind(wx.EVT_TIMER, lambda event: finish(), guard)
-    guard.StartOnce((timeout + 3) * 1000)
+    wx.CallLater((timeout + 5) * 1000, finish)
     app.MainLoop()
-    owner.Destroy()
 
 if __name__ == '__main__':
     try:
