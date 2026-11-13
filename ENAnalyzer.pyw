@@ -5,6 +5,7 @@
 ENAnalyzer - 希沃白板课件自动打包与管理工具
 支持完整性校验、按账户分类存储、自动转存、连续失败跳过等功能。
 -silent 启动参数，静默运行不显示主窗口，仅驻留系统托盘。
+-toast "消息" 启动参数，仅弹出浮窗通知，显示后自动退出。
 """
 
 import os
@@ -33,7 +34,19 @@ from PackQueue import (
     PackJob, PackQueue, scan_data_dir
 )
 
+def get_arg_value(argv, *names):
+    """读取形如 -name value 或 -name=value 的参数值，未找到返回 None。"""
+    for index, item in enumerate(argv):
+        for name in names:
+            if item == name and index + 1 < len(argv):
+                return argv[index + 1]
+            if item.startswith(name + "="):
+                return item[len(name) + 1:]
+    return None
+
 SILENT_MODE = "-silent" in sys.argv
+# 仅显示浮窗通知：ENAnalyzer.pyw -toast "消息内容"
+TOAST_MESSAGE = get_arg_value(sys.argv, "-toast", "--toast")
 
 def load_pack_log():
     """加载打包历史记录"""
@@ -65,10 +78,12 @@ class SquareButton(wx.Button):
         self.SetSize((edge, edge))
 
 class ToastNotification(wx.PopupTransientWindow):
-    """带撤销按钮的浮动通知"""
-    def __init__(self, parent, message, on_undo, timeout=7, bottom_margin=70):
+    """浮动通知；on_undo 为 None 时不显示撤销按钮。"""
+    def __init__(self, parent, message, on_undo=None, timeout=7, bottom_margin=70, on_dismiss=None):
         super().__init__(parent, flags=wx.BORDER_SIMPLE)
         self.on_undo = on_undo
+        self.on_dismiss = on_dismiss
+        self._dismissed = False
         self.timer = wx.Timer(self)
         self.timeout = timeout
         self.bottom_margin = bottom_margin
@@ -76,9 +91,11 @@ class ToastNotification(wx.PopupTransientWindow):
         panel = wx.Panel(self)
         sz = wx.BoxSizer(wx.HORIZONTAL)
 
-        btn_undo = SquareButton(panel, label="↩")
-        btn_undo.Bind(wx.EVT_BUTTON, self.on_undo_click)
-        sz.Add(btn_undo, 0, wx.ALIGN_CENTER_VERTICAL | wx.ALL, 5)
+        btn_undo = None
+        if on_undo is not None:
+            btn_undo = SquareButton(panel, label="↩")
+            btn_undo.Bind(wx.EVT_BUTTON, self.on_undo_click)
+            sz.Add(btn_undo, 0, wx.ALIGN_CENTER_VERTICAL | wx.ALL, 5)
 
         msg_text = wx.StaticText(panel, label=message, style=wx.ST_ELLIPSIZE_END)
         msg_text.Wrap(300)
@@ -92,8 +109,8 @@ class ToastNotification(wx.PopupTransientWindow):
         panel.Layout()
 
         txt_w = msg_text.GetBestSize().width
-        btn_h = btn_undo.GetBestSize().height
-        total_w = btn_h * 2 + txt_w + 30 + 60
+        btn_h = btn_close.GetBestSize().height
+        total_w = btn_h * (2 if btn_undo else 1) + txt_w + 30 + 60
         total_w = max(total_w, 300)
         screen_w, screen_h = wx.DisplaySize()
         total_w = min(total_w, screen_w - 40)
@@ -111,7 +128,8 @@ class ToastNotification(wx.PopupTransientWindow):
 
     def on_undo_click(self, event):
         self.timer.Stop()
-        self.on_undo()
+        if self.on_undo:
+            self.on_undo()
         self.Dismiss()
 
     def on_timer(self, event):
@@ -122,6 +140,11 @@ class ToastNotification(wx.PopupTransientWindow):
     def Dismiss(self):
         self.timer.Stop()
         super().Dismiss()
+        if self._dismissed:
+            return
+        self._dismissed = True
+        if self.on_dismiss:
+            self.on_dismiss()
 
 class TaskBarIcon(wx.adv.TaskBarIcon):
     """系统托盘图标"""
@@ -1459,6 +1482,30 @@ class MainFrame(wx.Frame):
         wx.GetApp().ExitMainLoop()
 
 # ---- 程序入口 ----
+def run_toast_mode(message, timeout=7):
+    """仅显示浮窗通知后退出：不创建单实例互斥，也不显示主窗口。"""
+    settings = load_settings()
+    try:
+        bottom_margin = int(settings.get('toast_bottom_margin', 70))
+    except (TypeError, ValueError):
+        bottom_margin = 70
+
+    app = wx.App()
+    owner = wx.Frame(None)
+    owner.Hide()
+
+    def finish():
+        wx.CallAfter(app.ExitMainLoop)
+
+    ToastNotification(owner, message, on_undo=None, timeout=timeout,
+                      bottom_margin=bottom_margin, on_dismiss=finish)
+    # 兜底计时：浮窗被系统提前关闭时也要保证进程退出
+    guard = wx.Timer(owner)
+    owner.Bind(wx.EVT_TIMER, lambda event: finish(), guard)
+    guard.StartOnce((timeout + 3) * 1000)
+    app.MainLoop()
+    owner.Destroy()
+
 if __name__ == '__main__':
     try:
         ctypes.windll.shcore.SetProcessDpiAwareness(2)
@@ -1467,6 +1514,11 @@ if __name__ == '__main__':
             ctypes.windll.user32.SetProcessDPIAware()
         except:
             pass
+
+    # 仅显示浮窗：不创建单实例互斥，显示完自动退出
+    if TOAST_MESSAGE is not None:
+        run_toast_mode(TOAST_MESSAGE)
+        sys.exit(0)
 
     app = wx.App()
     single_checker = wx.SingleInstanceChecker(f"{APP_NAME}_SingleInstance")
